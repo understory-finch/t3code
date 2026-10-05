@@ -367,6 +367,7 @@ export class ProviderAdapterMcpError extends Schema.TaggedError<ProviderAdapterM
       "session-not-running",
       "server-not-found",
       "action-unavailable",
+      "unsupported",
       "provider-failure",
     ]),
     serverName: Schema.optional(Schema.String),
@@ -381,6 +382,8 @@ export class ProviderAdapterMcpError extends Schema.TaggedError<ProviderAdapterM
         return `${this.driver} has no MCP server named ${this.serverName}.`;
       case "action-unavailable":
         return `${this.driver} MCP server ${this.serverName} does not accept that action now.`;
+      case "unsupported":
+        return `This ${this.driver} version does not support that MCP request.`;
       case "provider-failure":
         return `${this.driver} failed to manage its MCP servers.`;
     }

@@ -59,10 +59,19 @@ export function openMcpServersDialog(threadRef: ScopedThreadRef): void {
   appAtomRegistry.set(mcpServersDialogThreadAtom, threadRef);
 }
 
-/** Mounted once per chat view; shows the dialog for whichever thread asked for it. */
-export function McpServersDialogHost() {
+/**
+ * Mounted once per chat view with the thread it shows. The dialog acts on a live session, so it
+ * appears only over the thread it was opened for and closes when the view moves to another thread
+ * or goes away, instead of following the user there or popping up again later.
+ */
+export function McpServersDialogHost({ currentThreadRef }: { currentThreadRef: ScopedThreadRef }) {
   const threadRef = useAtomValue(mcpServersDialogThreadAtom);
-  if (threadRef === null) return null;
+  const currentThreadKey = scopedThreadKey(currentThreadRef);
+  useEffect(() => {
+    return () => appAtomRegistry.set(mcpServersDialogThreadAtom, null);
+    // oxlint-disable-next-line react/exhaustive-effect-dependencies -- Leaving the thread closes the dialog.
+  }, [currentThreadKey]);
+  if (threadRef === null || scopedThreadKey(threadRef) !== currentThreadKey) return null;
   return (
     // Keyed so nothing loaded or started for one thread carries over to another.
     <McpServersDialog
@@ -142,6 +151,10 @@ function McpServersDialog({
   const [refreshing, setRefreshing] = useState(false);
   const [requests, setRequests] = useState(NO_REQUESTS);
   const [signIns, setSignIns] = useState(NO_SIGN_INS);
+  // Polling stops a while after the user last refreshed or acted, so an open sign-in then asks
+  // for a refresh instead of promising an automatic update.
+  const [pollWindow, setPollWindow] = useState(0);
+  const [pollLapsed, setPollLapsed] = useState(false);
   // Lists and actions overlap. A list sent before an action settled would roll its result back.
   const issuedRef = useRef(0);
   const appliedRef = useRef(0);
@@ -168,6 +181,11 @@ function McpServersDialog({
     });
   }, []);
 
+  const reopenPollWindow = useCallback(() => {
+    setPollWindow((current) => current + 1);
+    setPollLapsed(false);
+  }, []);
+
   const setRequest = useCallback((serverName: string, request: McpServerRequest | null) => {
     setRequests((current) => {
       const next = new Map(current);
@@ -191,6 +209,7 @@ function McpServersDialog({
   }, [applyFailure, applyServers, environmentId, listServers, threadId]);
 
   const refresh = async () => {
+    reopenPollWindow();
     setRefreshing(true);
     await load();
     setRefreshing(false);
@@ -198,6 +217,8 @@ function McpServersDialog({
 
   const act = useCallback(
     async (input: ProviderMcpActionInput): Promise<ProviderMcpActionResult | null> => {
+      // A sign-in this starts, or a server it leaves connecting, is watched for a full window.
+      reopenPollWindow();
       setRequest(input.serverName, { pending: true, error: null });
       const result = await runServerAction({ environmentId, input });
       if (result._tag === "Success") {
@@ -214,14 +235,14 @@ function McpServersDialog({
       if (next?.notRunning) applyFailure(next);
       return null;
     },
-    [applyFailure, applyServers, environmentId, runServerAction, setRequest],
+    [applyFailure, applyServers, environmentId, reopenPollWindow, runServerAction, setRequest],
   );
 
   useEffect(() => {
     void load();
   }, [load]);
 
-  // Nothing pushes MCP status, so the dialog asks again only while something is settling.
+  // Nothing pushes MCP status, so the dialog asks again while something is settling.
   const needsPolling = mcpServersNeedPolling(servers, signIns);
   useEffect(() => {
     if (!needsPolling) return;
@@ -231,7 +252,9 @@ function McpServersDialog({
     const schedule = () => {
       timer = setTimeout(() => {
         void load().then(() => {
-          if (!stopped && Date.now() < deadline) schedule();
+          if (stopped) return;
+          if (Date.now() < deadline) schedule();
+          else setPollLapsed(true);
         });
       }, MCP_POLL_INTERVAL_MS);
     };
@@ -240,7 +263,8 @@ function McpServersDialog({
       stopped = true;
       clearTimeout(timer);
     };
-  }, [load, needsPolling]);
+    // oxlint-disable-next-line react/exhaustive-effect-dependencies -- Each refresh or action restarts the window.
+  }, [load, needsPolling, pollWindow]);
 
   const authenticate = async (server: ProviderMcpServer) => {
     // Browsers block tabs opened after an await, so the web build reserves one first.
@@ -262,13 +286,7 @@ function McpServersDialog({
       return;
     }
     setSignIns((current) =>
-      new Map(current).set(server.name, {
-        url,
-        acceptsCallback: auth.acceptsCallback,
-        fromStatus:
-          result.servers.find((candidate) => candidate.name === server.name)?.status ??
-          server.status,
-      }),
+      new Map(current).set(server.name, { url, acceptsCallback: auth.acceptsCallback }),
     );
     if (!(await openSignInPage(url, reserved))) {
       setRequest(server.name, {
@@ -286,7 +304,8 @@ function McpServersDialog({
         <DialogHeader>
           <DialogTitle>MCP servers</DialogTitle>
           <DialogDescription>
-            The MCP servers of this thread's running agent session.
+            The MCP servers of this thread's running agent session. Enabling or disabling a server
+            is saved for this project folder in Claude Code, so it also applies to later sessions.
           </DialogDescription>
         </DialogHeader>
         <DialogPanel>
@@ -329,6 +348,7 @@ function McpServersDialog({
                       server={server}
                       request={requests.get(server.name) ?? null}
                       signIn={signIns.get(server.name) ?? null}
+                      signInAwaitsRefresh={pollLapsed}
                       onAction={(action) => {
                         if (action === "authenticate") void authenticate(server);
                         else void act({ threadId, serverName: server.name, action });
@@ -392,6 +412,7 @@ function McpServerRow({
   server,
   request,
   signIn,
+  signInAwaitsRefresh,
   onAction,
   onSubmitCallback,
   onCancelSignIn,
@@ -399,6 +420,8 @@ function McpServerRow({
   server: ProviderMcpServer;
   request: McpServerRequest | null;
   signIn: McpSignIn | null;
+  /** The dialog has stopped checking, so finishing the sign-in shows only after a refresh. */
+  signInAwaitsRefresh: boolean;
   onAction: (action: ProviderMcpServerAction) => void;
   onSubmitCallback: (callbackUrl: string) => void;
   onCancelSignIn: () => void;
@@ -461,6 +484,7 @@ function McpServerRow({
       {signIn !== null ? (
         <McpSignInPanel
           signIn={signIn}
+          awaitsRefresh={signInAwaitsRefresh}
           pending={pending}
           onSubmitCallback={onSubmitCallback}
           onReconnect={() => onAction("reconnect")}
@@ -473,12 +497,14 @@ function McpServerRow({
 
 function McpSignInPanel({
   signIn,
+  awaitsRefresh,
   pending,
   onSubmitCallback,
   onReconnect,
   onCancel,
 }: {
   signIn: McpSignIn;
+  awaitsRefresh: boolean;
   pending: boolean;
   onSubmitCallback: (callbackUrl: string) => void;
   onReconnect: () => void;
@@ -489,7 +515,11 @@ function McpSignInPanel({
     <div className="flex flex-col gap-2 rounded-md border bg-muted/40 p-3 text-muted-foreground text-xs">
       {signIn.acceptsCallback ? (
         <>
-          <p>Finish signing in in your browser. This updates when it completes.</p>
+          <p>
+            {awaitsRefresh
+              ? "When you've finished signing in, press Refresh."
+              : "Finish signing in in your browser. This updates when it completes."}
+          </p>
           <p>If your browser ends on a page that won't load, paste its address here.</p>
           <form
             className="flex flex-col gap-2 sm:flex-row sm:items-center"

@@ -1065,13 +1065,15 @@ describe("ClaudeAdapterV2 MCP server management", () => {
     config: { type: "claudeai-proxy", url: "https://claude.ai/api/mcp/gmail", id: "gmail" },
   };
 
-  // Stands in for the CLI: records every control request and lets enable
-  // and disable change what the next status read reports.
+  // Stands in for the CLI: records every control request, lets toggles and
+  // reconnects change what the next status read reports, and rejects the
+  // requests named in `rejections`.
   const makeMcpHarness = Effect.fnUntraced(function* (input: {
     readonly servers: ReadonlyArray<McpServerStatus>;
     readonly authStarts?: Readonly<
       Record<string, { readonly authUrl: string | null; readonly callbackExpected: boolean }>
     >;
+    readonly rejections?: Readonly<Partial<Record<"reconnect" | "clear-auth", Error>>>;
   }) {
     const fileSystem = yield* FileSystem.FileSystem;
     const idAllocator = yield* IdAllocator.IdAllocatorV2;
@@ -1082,27 +1084,36 @@ describe("ClaudeAdapterV2 MCP server management", () => {
       Effect.sync(() => {
         calls.push(call);
       });
+    const rejection = (method: "reconnect" | "clear-auth") => {
+      const cause = input.rejections?.[method];
+      return cause === undefined
+        ? Effect.void
+        : Effect.fail(new ClaudeAdapterV2.ClaudeAgentSdkQueryRunnerError({ method, cause }));
+    };
+    const setStatus = (name: string, status: McpServerStatus["status"]) =>
+      Effect.sync(() => {
+        servers = servers.map((server): McpServerStatus =>
+          server.name === name ? { ...server, status } : server,
+        );
+      });
     const controls: ClaudeAdapterV2.ClaudeAgentSdkMcpControls = {
       status: Effect.sync(() => servers),
-      reconnect: (name) => record(`reconnect ${name}`),
+      reconnect: (name) =>
+        record(`reconnect ${name}`).pipe(
+          Effect.andThen(rejection("reconnect")),
+          Effect.andThen(setStatus(name, "connected")),
+        ),
       toggle: (name, enabled) =>
         record(`toggle ${name} ${enabled}`).pipe(
-          Effect.tap(() =>
-            Effect.sync(() => {
-              servers = servers.map((server): McpServerStatus =>
-                server.name === name
-                  ? { ...server, status: enabled ? "pending" : "disabled" }
-                  : server,
-              );
-            }),
-          ),
+          Effect.andThen(setStatus(name, enabled ? "pending" : "disabled")),
         ),
       authenticate: (name) =>
         record(`authenticate ${name}`).pipe(
           Effect.as(input.authStarts?.[name] ?? { authUrl: null, callbackExpected: false }),
         ),
       submitOAuthCallbackUrl: (name, callbackUrl) => record(`callback ${name} ${callbackUrl}`),
-      clearAuth: (name) => record(`clear-auth ${name}`),
+      clearAuth: (name) =>
+        record(`clear-auth ${name}`).pipe(Effect.andThen(rejection("clear-auth"))),
     };
     const adapter = ClaudeAdapterV2.makeClaudeAdapterV2({
       instanceId: ClaudeAdapterV2.CLAUDE_DEFAULT_INSTANCE_ID,
@@ -1400,7 +1411,9 @@ describe("ClaudeAdapterV2 MCP server management", () => {
         const hostile = yield* authenticate("hostile").pipe(Effect.flip);
         assert.equal(hostile.reason, "provider-failure");
 
-        yield* harness.mcp.act({
+        // The CLI leaves a server signed out after a pasted callback until
+        // it is told to reconnect.
+        const signedIn = yield* harness.mcp.act({
           threadId: harness.threadId,
           providerThread: harness.providerThread,
           serverName: "linear",
@@ -1413,7 +1426,70 @@ describe("ClaudeAdapterV2 MCP server management", () => {
           "authenticate quiet",
           "authenticate hostile",
           "callback linear http://localhost:4567/callback?code=abc&state=xyz",
+          "reconnect linear",
         ]);
+        assert.equal(
+          signedIn.servers.find((server) => server.name === "linear")?.status,
+          "connected",
+        );
+      }).pipe(Effect.provide(Layer.merge(IdAllocator.layer, NodeServices.layer))),
+    ),
+  );
+
+  it.effect("keeps a pasted sign-in when the reconnect after it fails", () =>
+    Effect.scoped(
+      Effect.gen(function* () {
+        const harness = yield* makeMcpHarness({
+          servers: [linearServer],
+          rejections: { reconnect: new Error("connect ECONNREFUSED 127.0.0.1:443") },
+        });
+        yield* harness.startTurn;
+
+        const signedIn = yield* harness.mcp.act({
+          threadId: harness.threadId,
+          providerThread: harness.providerThread,
+          serverName: "linear",
+          action: "submit-oauth-callback",
+          callbackUrl: "http://localhost:4567/callback?code=abc&state=xyz",
+        });
+        assert.deepEqual(harness.calls, [
+          "callback linear http://localhost:4567/callback?code=abc&state=xyz",
+          "reconnect linear",
+        ]);
+        assert.deepEqual(
+          signedIn.servers.map((server) => server.name),
+          ["linear"],
+        );
+      }).pipe(Effect.provide(Layer.merge(IdAllocator.layer, NodeServices.layer))),
+    ),
+  );
+
+  it.effect("tells a request this Claude CLI predates apart from a failed one", () =>
+    Effect.scoped(
+      Effect.gen(function* () {
+        const harness = yield* makeMcpHarness({
+          servers: [{ ...linearServer, status: "connected" }],
+          rejections: {
+            "clear-auth": new Error("Unsupported control request subtype: mcp_clear_auth"),
+            reconnect: new Error("connect ECONNREFUSED 127.0.0.1:443"),
+          },
+        });
+        yield* harness.startTurn;
+        const act = (action: "clear-auth" | "reconnect") =>
+          harness.mcp
+            .act({
+              threadId: harness.threadId,
+              providerThread: harness.providerThread,
+              serverName: "linear",
+              action,
+            })
+            .pipe(Effect.flip);
+
+        const outdated = yield* act("clear-auth");
+        assert.equal(outdated.reason, "unsupported");
+        assert.equal(outdated.serverName, "linear");
+        const failed = yield* act("reconnect");
+        assert.equal(failed.reason, "provider-failure");
       }).pipe(Effect.provide(Layer.merge(IdAllocator.layer, NodeServices.layer))),
     ),
   );

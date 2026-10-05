@@ -12,17 +12,10 @@ import * as Context from "effect/Context";
 import * as Effect from "effect/Effect";
 import * as Layer from "effect/Layer";
 import * as Option from "effect/Option";
-import * as Schema from "effect/Schema";
 
 import * as ProjectionStore from "./ProjectionStore.ts";
 import * as ProviderAdapter from "./ProviderAdapter.ts";
 import * as ProviderSessionManager from "./ProviderSessionManager.ts";
-
-const isProviderMcpError = Schema.is(ProviderMcpError);
-const isProviderAdapterMcpError = Schema.is(ProviderAdapter.ProviderAdapterMcpError);
-const isProjectionStoreThreadNotFoundError = Schema.is(
-  ProjectionStore.ProjectionStoreThreadNotFoundError,
-);
 
 const ACTION_PHRASES: Record<ProviderMcpActionInput["action"], string> = {
   reconnect: "reconnect",
@@ -66,25 +59,21 @@ interface FailureContext {
   readonly threadId: ThreadId;
   readonly serverName?: string;
   readonly action?: ProviderMcpActionInput["action"];
-  readonly failure: (provider: string) => string;
+  /** What was asked of the agent, such as `list its MCP servers`. */
+  readonly request: string;
 }
 
 // Details reach the user verbatim, so they name the server and the step that
 // failed but never carry provider output, which may echo OAuth codes or URLs.
-function toProviderMcpError(cause: unknown, context: FailureContext): ProviderMcpError {
+function fromAdapterError(
+  error: ProviderAdapter.ProviderAdapterMcpError,
+  context: FailureContext,
+): ProviderMcpError {
   const { threadId, serverName } = context;
-  if (isProviderMcpError(cause)) return cause;
-  if (isProjectionStoreThreadNotFoundError(cause)) {
-    return new ProviderMcpError({
-      threadId,
-      reason: "thread-not-found",
-      detail: "This thread no longer exists.",
-    });
-  }
-  const adapterError = isProviderAdapterMcpError(cause) ? cause : undefined;
-  switch (adapterError?.reason) {
+  const name = displayName(error.driver);
+  switch (error.reason) {
     case "session-not-running":
-      return notRunning(threadId, adapterError.driver);
+      return notRunning(threadId, error.driver);
     case "server-not-found":
       return new ProviderMcpError({
         threadId,
@@ -97,13 +86,87 @@ function toProviderMcpError(cause: unknown, context: FailureContext): ProviderMc
         reason: "action-unavailable",
         detail: `"${serverName}" does not accept that action right now. Refresh the list and try again.`,
       });
-    default:
+    case "unsupported": {
+      const cli = name === undefined ? "the agent's CLI" : `the ${name} CLI`;
+      return new ProviderMcpError({
+        threadId,
+        reason: "unsupported",
+        detail: `This version of ${cli} cannot ${context.request} from T3 Code. Update it, then restart the agent session.`,
+      });
+    }
+    case "provider-failure":
       return new ProviderMcpError({
         threadId,
         reason: "provider-failure",
-        detail: context.failure(displayName(adapterError?.driver) ?? "The agent"),
+        detail: `${name ?? "The agent"} could not ${context.request}.`,
       });
   }
+}
+
+type ProviderMcpRequestError =
+  | ProjectionStore.ProjectionStoreV2Error
+  | ProviderSessionManager.ProviderSessionManagerV2Error
+  | ProviderAdapter.ProviderAdapterMcpError
+  | ProviderMcpError;
+
+// Every upstream tag is listed so a new one fails to compile instead of
+// reaching the user under the wrong reason.
+function failWith(context: FailureContext) {
+  const logContext = {
+    threadId: context.threadId,
+    serverName: context.serverName,
+    action: context.action,
+  };
+  // T3's own projection or session bookkeeping failed, not the agent.
+  const internal = (
+    cause:
+      | ProjectionStore.ProjectionStoreV2Error
+      | ProviderSessionManager.ProviderSessionManagerV2Error,
+  ) =>
+    Effect.logError("T3 could not resolve the session for an MCP request", {
+      ...logContext,
+      cause,
+    }).pipe(
+      Effect.andThen(
+        Effect.fail(
+          new ProviderMcpError({
+            threadId: context.threadId,
+            reason: "internal",
+            detail: "T3 Code could not read this thread's session state.",
+          }),
+        ),
+      ),
+    );
+  return <A, R>(
+    effect: Effect.Effect<A, ProviderMcpRequestError, R>,
+  ): Effect.Effect<A, ProviderMcpError, R> =>
+    Effect.catchTags(effect, {
+      ProjectionStoreThreadNotFoundError: () =>
+        Effect.fail(
+          new ProviderMcpError({
+            threadId: context.threadId,
+            reason: "thread-not-found",
+            detail: "This thread no longer exists.",
+          }),
+        ),
+      ProjectionStoreReadError: internal,
+      ProjectionStoreSetupError: internal,
+      ProjectionStoreApplyEventError: internal,
+      ProviderSessionOpenError: internal,
+      ProviderWorkspaceMissingError: internal,
+      ProviderSessionLookupError: internal,
+      ProviderSessionCloseError: internal,
+      ProviderSessionReleaseError: internal,
+      ProviderSessionActivityError: internal,
+      ProviderAdapterMcpError: (cause) => {
+        const error = fromAdapterError(cause, context);
+        const log =
+          error.reason === "provider-failure"
+            ? Effect.logWarning("provider MCP request failed", { ...logContext, cause })
+            : Effect.void;
+        return log.pipe(Effect.andThen(Effect.fail(error)));
+      },
+    });
 }
 
 const make = Effect.gen(function* () {
@@ -132,36 +195,12 @@ const make = Effect.gen(function* () {
     return { providerThread, controls: runtime.mcp };
   });
 
-  const failWith =
-    (context: FailureContext) =>
-    <A, E, R>(effect: Effect.Effect<A, E, R>) =>
-      effect.pipe(
-        Effect.catch((cause) => {
-          const error = toProviderMcpError(cause, context);
-          const log =
-            error.reason === "provider-failure"
-              ? Effect.logWarning("provider MCP request failed", {
-                  threadId: context.threadId,
-                  serverName: context.serverName,
-                  action: context.action,
-                  cause,
-                })
-              : Effect.void;
-          return log.pipe(Effect.andThen(Effect.fail(error)));
-        }),
-      );
-
   return ProviderMcpService.of({
     list: (input) =>
       Effect.gen(function* () {
         const { providerThread, controls } = yield* liveControls(input.threadId);
         return { servers: yield* controls.list({ providerThread }) };
-      }).pipe(
-        failWith({
-          threadId: input.threadId,
-          failure: (provider) => `${provider} could not list its MCP servers.`,
-        }),
-      ),
+      }).pipe(failWith({ threadId: input.threadId, request: "list its MCP servers" })),
     act: (input) =>
       Effect.gen(function* () {
         const { providerThread, controls } = yield* liveControls(input.threadId);
@@ -171,8 +210,7 @@ const make = Effect.gen(function* () {
           threadId: input.threadId,
           serverName: input.serverName,
           action: input.action,
-          failure: (provider) =>
-            `${provider} could not ${ACTION_PHRASES[input.action]} "${input.serverName}".`,
+          request: `${ACTION_PHRASES[input.action]} "${input.serverName}"`,
         }),
       ),
   });

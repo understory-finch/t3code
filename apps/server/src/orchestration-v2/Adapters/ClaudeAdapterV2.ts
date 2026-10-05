@@ -431,7 +431,6 @@ const isProviderAdapterRuntimeRequestResponseError = Schema.is(
 const isProviderAdapterRollbackThreadError = Schema.is(
   ProviderAdapter.ProviderAdapterRollbackThreadError,
 );
-const isProviderAdapterMcpError = Schema.is(ProviderAdapter.ProviderAdapterMcpError);
 
 function queryRunnerError(cause: unknown, method: string): ClaudeAgentSdkQueryRunnerError {
   return isClaudeAgentSdkQueryRunnerError(cause)
@@ -677,9 +676,19 @@ function hasClaudeQueryMcpAuthMethod<Method extends keyof ClaudeQueryMcpAuthMeth
   return typeof Reflect.get(queryRuntime, method) === "function";
 }
 
+// How a CLI that predates an MCP control request refuses it. A missing SDK
+// method is reported the same way so both tell the user to update Claude Code.
+const CLAUDE_UNSUPPORTED_CONTROL_REQUEST = "Unsupported control request subtype";
+
 function missingClaudeQueryMcpAuthMethod(method: keyof ClaudeQueryMcpAuthMethods) {
   return Promise.reject(
-    new Error(`This Claude Agent SDK does not support ${method}. Update Claude Code.`),
+    new Error(`${CLAUDE_UNSUPPORTED_CONTROL_REQUEST}: this Claude Agent SDK has no ${method}.`),
+  );
+}
+
+function isUnsupportedClaudeMcpRequest(error: ClaudeAgentSdkQueryRunnerError): boolean {
+  return (
+    error.cause instanceof Error && error.cause.message.includes(CLAUDE_UNSUPPORTED_CONTROL_REQUEST)
   );
 }
 
@@ -7759,6 +7768,14 @@ export function makeClaudeAdapterV2(
             reason,
             ...details,
           });
+        const mcpRequestError = (
+          cause: ClaudeAgentSdkQueryRunnerError,
+          details: { readonly serverName?: string } = {},
+        ) =>
+          mcpError(isUnsupportedClaudeMcpRequest(cause) ? "unsupported" : "provider-failure", {
+            ...details,
+            cause,
+          });
 
         // MCP servers run inside the CLI process, so only the thread's live
         // query can answer. Opening one here would start Claude outside a turn.
@@ -7788,9 +7805,7 @@ export function makeClaudeAdapterV2(
           },
           (effect) =>
             effect.pipe(
-              Effect.mapError((cause) =>
-                isProviderAdapterMcpError(cause) ? cause : mcpError("provider-failure", { cause }),
-              ),
+              Effect.catchTag("ClaudeAgentSdkQueryRunnerError", (cause) => mcpRequestError(cause)),
             ),
         );
 
@@ -7841,6 +7856,15 @@ export function makeClaudeAdapterV2(
                 break;
               case "submit-oauth-callback":
                 yield* controls.submitOAuthCallbackUrl(server.name, actInput.callbackUrl);
+                // After a pasted callback the CLI stores the tokens but waits
+                // for the host to reconnect the server. The sign-in already
+                // succeeded, so a failed reconnect only shows in the status.
+                yield* controls.reconnect(server.name).pipe(
+                  Effect.ignore({
+                    log: "Warn",
+                    message: "Claude could not reconnect an MCP server after sign-in",
+                  }),
+                );
                 break;
             }
             const servers = claudeMcpServers(yield* controls.status);
@@ -7848,10 +7872,8 @@ export function makeClaudeAdapterV2(
           },
           (effect, actInput) =>
             effect.pipe(
-              Effect.mapError((cause) =>
-                isProviderAdapterMcpError(cause)
-                  ? cause
-                  : mcpError("provider-failure", { serverName: actInput.serverName, cause }),
+              Effect.catchTag("ClaudeAgentSdkQueryRunnerError", (cause) =>
+                mcpRequestError(cause, { serverName: actInput.serverName }),
               ),
             ),
         );

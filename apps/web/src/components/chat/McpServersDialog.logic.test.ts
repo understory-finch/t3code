@@ -12,13 +12,13 @@ function server(name: string, status: ProviderMcpServerStatus): ProviderMcpServe
   return { name, status, managed: false, actions: [] };
 }
 
-function signIn(fromStatus: ProviderMcpServerStatus): McpSignIn {
-  return { url: "https://auth.example.com/authorize", acceptsCallback: true, fromStatus };
+function signIn(acceptsCallback = true): McpSignIn {
+  return { url: "https://auth.example.com/authorize", acceptsCallback };
 }
 
 describe("settleMcpSignIns", () => {
   it("keeps a sign-in while its server still waits for it", () => {
-    const signIns = new Map([["github", signIn("needs-auth")]]);
+    const signIns = new Map([["github", signIn()]]);
     expect(settleMcpSignIns(signIns, [server("github", "needs-auth")])).toBe(signIns);
     expect(settleMcpSignIns(signIns, [server("github", "pending")])).toBe(signIns);
     expect(settleMcpSignIns(signIns, [server("github", "failed")])).toBe(signIns);
@@ -26,35 +26,36 @@ describe("settleMcpSignIns", () => {
 
   it("ends a sign-in once its server connects, is disabled, or disappears", () => {
     const signIns = new Map([
-      ["github", signIn("needs-auth")],
-      ["linear", signIn("needs-auth")],
-      ["sentry", signIn("failed")],
+      ["github", signIn()],
+      ["linear", signIn()],
+      ["sentry", signIn()],
+      ["notion", signIn()],
     ]);
     const settled = settleMcpSignIns(signIns, [
       server("github", "connected"),
       server("sentry", "disabled"),
+      server("notion", "needs-auth"),
     ]);
-    expect([...settled.keys()]).toEqual([]);
-  });
-
-  it("does not end a re-authentication of a server that was already connected", () => {
-    const signIns = new Map([["github", signIn("connected")]]);
-    expect(settleMcpSignIns(signIns, [server("github", "connected")])).toBe(signIns);
+    expect([...settled.keys()]).toEqual(["notion"]);
   });
 });
 
 describe("mcpServersNeedPolling", () => {
-  it("polls only while a server connects or a sign-in is open", () => {
+  it("polls only while a server connects or a sign-in can finish on its own", () => {
     expect(mcpServersNeedPolling(null, new Map())).toBe(false);
     expect(mcpServersNeedPolling([server("github", "connected")], new Map())).toBe(false);
     expect(mcpServersNeedPolling([server("github", "needs-auth")], new Map())).toBe(false);
     expect(mcpServersNeedPolling([server("github", "pending")], new Map())).toBe(true);
     expect(
-      mcpServersNeedPolling(
-        [server("github", "needs-auth")],
-        new Map([["github", signIn("needs-auth")]]),
-      ),
+      mcpServersNeedPolling([server("github", "needs-auth")], new Map([["github", signIn()]])),
     ).toBe(true);
+  });
+
+  it("does not poll for a claude.ai connector sign-in, which finishes only on reconnect", () => {
+    const servers = [server("claude.ai Gmail", "needs-auth"), server("github", "connected")];
+    expect(mcpServersNeedPolling(servers, new Map([["claude.ai Gmail", signIn(false)]]))).toBe(
+      false,
+    );
   });
 });
 

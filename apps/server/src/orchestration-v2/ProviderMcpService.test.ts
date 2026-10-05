@@ -34,23 +34,19 @@ const encodeProviderMcpErrorsJson = Schema.encodeEffect(
 function testLayer(input: {
   readonly providerThreads?: ReadonlyArray<OrchestrationV2ProviderThread>;
   readonly runtime?: Partial<ProviderAdapter.ProviderAdapterV2SessionRuntime>;
-  readonly threadMissing?: boolean;
+  readonly readFailure?: ProjectionStore.ProjectionStoreV2Error;
 }) {
   return ProviderMcpService.layer.pipe(
     Layer.provide(
       Layer.mergeAll(
         Layer.mock(ProjectionStore.ProjectionStoreV2)({
-          getThreadRecords: (requestedThreadId) =>
-            input.threadMissing === true
-              ? Effect.fail(
-                  new ProjectionStore.ProjectionStoreThreadNotFoundError({
-                    threadId: requestedThreadId,
-                  }),
-                )
-              : Effect.succeed({
+          getThreadRecords: () =>
+            input.readFailure === undefined
+              ? Effect.succeed({
                   thread: { activeProviderThreadId: providerThread.id },
                   providerThreads: input.providerThreads ?? [providerThread],
-                } as never),
+                } as never)
+              : Effect.fail(input.readFailure),
         }),
         Layer.mock(ProviderSessionManager.ProviderSessionManagerV2)({
           get: () =>
@@ -85,8 +81,22 @@ it.effect("asks the user to start the agent when no live session serves the thre
       "The agent is not running for this thread. Send a message to start it, then try again.",
     );
 
-    const missing = yield* listError(testLayer({ threadMissing: true }));
+    const missing = yield* listError(
+      testLayer({
+        readFailure: new ProjectionStore.ProjectionStoreThreadNotFoundError({ threadId }),
+      }),
+    );
     assert.equal(missing.reason, "thread-not-found");
+  }),
+);
+
+it.effect("does not blame the agent when T3 cannot read the thread's state", () =>
+  Effect.gen(function* () {
+    const error = yield* listError(
+      testLayer({ readFailure: new ProjectionStore.ProjectionStoreReadError({ threadId }) }),
+    );
+    assert.equal(error.reason, "internal");
+    assert.equal(error.detail, "T3 Code could not read this thread's session state.");
   }),
 );
 
@@ -103,6 +113,10 @@ it.effect("names a provider that cannot manage MCP servers", () =>
 it.effect("acts on the active provider thread and keeps provider output out of errors", () => {
   const callbackUrl = "http://localhost:4567/callback?code=secret-code&state=xyz";
   const received: Array<ProviderAdapter.ProviderAdapterV2McpActionInput> = [];
+  const adapterReasons: Record<string, ProviderAdapter.ProviderAdapterMcpError["reason"]> = {
+    linear: "provider-failure",
+    notion: "unsupported",
+  };
   const runtime: Partial<ProviderAdapter.ProviderAdapterV2SessionRuntime> = {
     driver: claude,
     mcp: {
@@ -113,7 +127,7 @@ it.effect("acts on the active provider thread and keeps provider output out of e
             Effect.fail(
               new ProviderAdapter.ProviderAdapterMcpError({
                 driver: claude,
-                reason: actInput.serverName === "linear" ? "provider-failure" : "server-not-found",
+                reason: adapterReasons[actInput.serverName] ?? "server-not-found",
                 serverName: actInput.serverName,
                 cause: new Error(`OAuth exchange failed for ${callbackUrl}`),
               }),
@@ -140,9 +154,16 @@ it.effect("acts on the active provider thread and keeps provider output out of e
     assert.isUndefined(failed.cause);
     assert.equal(received[0]?.providerThread, providerThread);
 
+    const outdated = yield* act({ threadId, serverName: "notion", action: "clear-auth" });
+    assert.equal(outdated.reason, "unsupported");
+    assert.equal(
+      outdated.detail,
+      'This version of the Claude CLI cannot sign out of "notion" from T3 Code. Update it, then restart the agent session.',
+    );
+
     const missing = yield* act({ threadId, serverName: "gone", action: "reconnect" });
     assert.equal(missing.reason, "server-not-found");
-    const wire = yield* encodeProviderMcpErrorsJson([failed, missing]);
+    const wire = yield* encodeProviderMcpErrorsJson([failed, outdated, missing]);
     assert.notInclude(wire, "secret-code");
   });
 });

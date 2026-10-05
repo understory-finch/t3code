@@ -11655,7 +11655,7 @@ export default function ChatView(props: ChatViewProps) {
         </AlertDialogPopup>
       </AlertDialog>
       <LinkPullRequestDialogHost />
-      <McpServersDialogHost />
+      <McpServersDialogHost currentThreadRef={routeThreadRef} />
       {expandedImage && (
         <ExpandedImageDialog
           key={expandedImageKey(expandedImage)}

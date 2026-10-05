@@ -1,12 +1,14 @@
-import type { ProviderMcpServer, ProviderMcpServerStatus } from "@t3tools/contracts";
+import type { ProviderMcpServer } from "@t3tools/contracts";
 
 /** A sign-in the user is finishing in a browser, keyed by server name. */
 export interface McpSignIn {
   readonly url: string;
-  /** The final redirect can be pasted back for a browser that cannot reach the server host. */
+  /**
+   * The provider listens for the final redirect, so the sign-in can finish without the user, and
+   * the redirect can be pasted back for a browser that cannot reach the server host. Otherwise
+   * (claude.ai connectors) it finishes only when the user reconnects.
+   */
   readonly acceptsCallback: boolean;
-  /** The server's status when the sign-in started; only a change away from it can finish it. */
-  readonly fromStatus: ProviderMcpServerStatus;
 }
 
 /** Drops sign-ins whose server has since connected, been disabled, or gone away. */
@@ -15,25 +17,27 @@ export function settleMcpSignIns(
   servers: ReadonlyArray<ProviderMcpServer>,
 ): ReadonlyMap<string, McpSignIn> {
   const next = new Map(signIns);
-  for (const [name, signIn] of signIns) {
+  for (const name of signIns.keys()) {
     const server = servers.find((candidate) => candidate.name === name);
-    if (
-      server === undefined ||
-      (server.status !== signIn.fromStatus &&
-        (server.status === "connected" || server.status === "disabled"))
-    ) {
+    if (server === undefined || server.status === "connected" || server.status === "disabled") {
       next.delete(name);
     }
   }
   return next.size === signIns.size ? signIns : next;
 }
 
-/** Status only changes without a request from this dialog while a server connects or signs in. */
+/**
+ * Status only changes without a request from this dialog while a server connects or a sign-in
+ * the provider listens for completes.
+ */
 export function mcpServersNeedPolling(
   servers: ReadonlyArray<ProviderMcpServer> | null,
   signIns: ReadonlyMap<string, McpSignIn>,
 ): boolean {
-  return signIns.size > 0 || (servers?.some((server) => server.status === "pending") ?? false);
+  return (
+    [...signIns.values()].some((signIn) => signIn.acceptsCallback) ||
+    (servers?.some((server) => server.status === "pending") ?? false)
+  );
 }
 
 /**

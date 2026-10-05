@@ -69,6 +69,9 @@ reconnect a server, disable or enable it, sign in, or sign out. This works only 
 running for the thread; if it is not, send a message first. Servers you add to or remove from
 Claude Code's configuration appear after **Restart agent session**.
 
+Disabling or enabling a server is saved for the project folder in Claude Code's own settings, so
+it also applies to later sessions, other threads in that folder, and the `claude` CLI there.
+
 Signing in opens the server's sign-in page in your browser, and the server connects once you
 approve access. If T3 Code runs on another machine, such as over a remote connection or T3
 Connect, the browser ends on a `localhost` page that does not load. Copy that page's address and

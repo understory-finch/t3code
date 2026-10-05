@@ -96,6 +96,8 @@ export const ProviderMcpErrorReason = Schema.Literals([
   "server-not-found",
   "action-unavailable",
   "provider-failure",
+  /** T3 Code's own state failed, not the agent. */
+  "internal",
 ]);
 export type ProviderMcpErrorReason = typeof ProviderMcpErrorReason.Type;
 
