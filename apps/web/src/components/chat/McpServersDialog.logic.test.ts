@@ -2,8 +2,10 @@ import type { ProviderMcpServer, ProviderMcpServerStatus } from "@t3tools/contra
 import { describe, expect, it } from "vite-plus/test";
 
 import {
+  mcpServerDisplayOrder,
   mcpServersNeedPolling,
   mcpSignInUrl,
+  orderMcpServers,
   settleMcpSignIns,
   type McpSignIn,
 } from "./McpServersDialog.logic";
@@ -70,5 +72,36 @@ describe("mcpSignInUrl", () => {
     expect(mcpSignInUrl("javascript:alert(document.cookie)")).toBeNull();
     expect(mcpSignInUrl("data:text/html,<script>alert(1)</script>")).toBeNull();
     expect(mcpSignInUrl("not a url")).toBeNull();
+  });
+});
+
+describe("mcp server ordering", () => {
+  it("lists servers that need the user first and keeps that order as statuses change", () => {
+    const loaded = [
+      server("playwright", "connected"),
+      server("linear", "needs-auth"),
+      server("figma", "failed"),
+      server("notes", "disabled"),
+      server("slack", "needs-auth"),
+    ];
+    const order = mcpServerDisplayOrder(loaded);
+    expect(order).toEqual(["linear", "slack", "figma", "playwright", "notes"]);
+
+    const afterSignIn = [
+      server("playwright", "connected"),
+      server("linear", "connected"),
+      server("figma", "failed"),
+      server("notes", "disabled"),
+      server("slack", "needs-auth"),
+      server("github", "needs-auth"),
+    ];
+    expect(orderMcpServers(afterSignIn, order).map((entry) => entry.name)).toEqual([
+      "linear",
+      "slack",
+      "figma",
+      "playwright",
+      "notes",
+      "github",
+    ]);
   });
 });

@@ -1,4 +1,42 @@
-import type { ProviderMcpServer } from "@t3tools/contracts";
+import type { ProviderMcpServer, ProviderMcpServerStatus } from "@t3tools/contracts";
+
+const ATTENTION_RANK = {
+  "needs-auth": 0,
+  failed: 1,
+  pending: 2,
+  connected: 3,
+  disabled: 4,
+} as const satisfies Record<ProviderMcpServerStatus, number>;
+
+/** Server names with the ones that need the user first, otherwise in the provider's order. */
+export function mcpServerDisplayOrder(
+  servers: ReadonlyArray<ProviderMcpServer>,
+): ReadonlyArray<string> {
+  return servers
+    .map((server, index) => ({ server, index }))
+    .toSorted(
+      (a, b) =>
+        ATTENTION_RANK[a.server.status] - ATTENTION_RANK[b.server.status] || a.index - b.index,
+    )
+    .map(({ server }) => server.name);
+}
+
+/**
+ * Sorts by an order fixed when the list first loaded, so a row stays put while the user acts on
+ * it. Servers that appeared later go last.
+ */
+export function orderMcpServers(
+  servers: ReadonlyArray<ProviderMcpServer>,
+  order: ReadonlyArray<string>,
+): ReadonlyArray<ProviderMcpServer> {
+  const position = new Map(order.map((name, index) => [name, index]));
+  const rank = (server: ProviderMcpServer, index: number) =>
+    position.get(server.name) ?? order.length + index;
+  return servers
+    .map((server, index) => ({ server, rank: rank(server, index) }))
+    .toSorted((a, b) => a.rank - b.rank)
+    .map(({ server }) => server);
+}
 
 /** A sign-in the user is finishing in a browser, keyed by server name. */
 export interface McpSignIn {

@@ -2026,7 +2026,15 @@ function OpenCommandPaletteDialog(props: {
       actionItems.push({
         kind: "action",
         value: "action:manage-mcp-servers",
-        searchTerms: ["mcp", "servers", "connectors", "tools", "authenticate", "sign in"],
+        searchTerms: [
+          "manage mcp servers",
+          "mcp",
+          "servers",
+          "connectors",
+          "tools",
+          "authenticate",
+          "sign in",
+        ],
         title: "Manage MCP servers",
         icon: <PlugIcon className={ITEM_ICON_CLASS} />,
         run: async () => {

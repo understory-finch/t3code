@@ -39,8 +39,10 @@ import { Input } from "../ui/input";
 import { RefreshIcon } from "../ui/refresh-icon";
 import { Spinner } from "../ui/spinner";
 import {
+  mcpServerDisplayOrder,
   mcpServersNeedPolling,
   mcpSignInUrl,
+  orderMcpServers,
   settleMcpSignIns,
   type McpSignIn,
 } from "./McpServersDialog.logic";
@@ -147,6 +149,7 @@ function McpServersDialog({
   const listServers = useAtomCommand(providerMcpEnvironment.list, { reportFailure: false });
   const runServerAction = useAtomCommand(providerMcpEnvironment.action, { reportFailure: false });
   const [servers, setServers] = useState<ReadonlyArray<ProviderMcpServer> | null>(null);
+  const [order, setOrder] = useState<ReadonlyArray<string> | null>(null);
   const [failure, setFailure] = useState<McpFailure | null>(null);
   const [refreshing, setRefreshing] = useState(false);
   const [requests, setRequests] = useState(NO_REQUESTS);
@@ -161,6 +164,7 @@ function McpServersDialog({
 
   const applyServers = useCallback((next: ReadonlyArray<ProviderMcpServer>) => {
     setServers(next);
+    setOrder((current) => current ?? mcpServerDisplayOrder(next));
     setFailure(null);
     setSignIns((current) => settleMcpSignIns(current, next));
   }, []);
@@ -169,6 +173,7 @@ function McpServersDialog({
     setFailure(next);
     if (!next.notRunning) return;
     setServers(null);
+    setOrder(null);
     setSignIns(NO_SIGN_INS);
   }, []);
 
@@ -342,7 +347,7 @@ function McpServersDialog({
                 </p>
               ) : (
                 <ul className="divide-y">
-                  {servers.map((server) => (
+                  {orderMcpServers(servers, order ?? []).map((server) => (
                     <McpServerRow
                       key={server.name}
                       server={server}
