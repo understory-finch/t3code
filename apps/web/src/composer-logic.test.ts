@@ -22,8 +22,10 @@ import {
   expandCollapsedComposerCursor,
   formatAssistantCitationForComposer,
   isCollapsedCursorAdjacentToInlineToken,
+  isMcpServersCommand,
   parseStandaloneComposerSlashCommand,
   replaceTextRange,
+  slashTriggerStandsAlone,
 } from "./composer-logic";
 import { carryDisplacedCustomAnswerIntoPrompt } from "./pendingUserInput";
 import { formatTerminalContextReference } from "./lib/terminalContext";
@@ -815,5 +817,42 @@ describe("parseStandaloneComposerSlashCommand", () => {
 
   it("ignores slash commands with extra message text", () => {
     expect(parseStandaloneComposerSlashCommand("/plan explain this")).toBeNull();
+  });
+
+  it("leaves /mcp to its own handler", () => {
+    expect(parseStandaloneComposerSlashCommand("/mcp")).toBeNull();
+  });
+});
+
+describe("isMcpServersCommand", () => {
+  it("matches /mcp on its own, ignoring case and surrounding whitespace", () => {
+    expect(isMcpServersCommand("/mcp")).toBe(true);
+    expect(isMcpServersCommand("  /MCP \n")).toBe(true);
+  });
+
+  it("keeps anything with arguments or a longer name as a prompt", () => {
+    expect(isMcpServersCommand("/mcp reconnect github")).toBe(false);
+    expect(isMcpServersCommand("/mcp-tools")).toBe(false);
+    expect(isMcpServersCommand("please run /mcp")).toBe(false);
+  });
+});
+
+describe("slashTriggerStandsAlone", () => {
+  it("accepts a slash command that is the whole prompt", () => {
+    expect(slashTriggerStandsAlone("/mc", detectComposerTrigger("/mc", 3))).toBe(true);
+  });
+
+  it("rejects a slash command with text before or after it", () => {
+    const before = "fix this\n/mc";
+    expect(slashTriggerStandsAlone(before, detectComposerTrigger(before, before.length))).toBe(
+      false,
+    );
+    const after = "/mc\nthen continue";
+    expect(slashTriggerStandsAlone(after, detectComposerTrigger(after, 3))).toBe(false);
+  });
+
+  it("rejects other triggers", () => {
+    expect(slashTriggerStandsAlone("@src", detectComposerTrigger("@src", 4))).toBe(false);
+    expect(slashTriggerStandsAlone("", null)).toBe(false);
   });
 });

@@ -175,6 +175,7 @@ import { useDiffPanelStore } from "../diffPanelStore";
 import {
   type ComposerSubmissionIntent,
   collapseExpandedComposerCursor,
+  isMcpServersCommand,
   parseStandaloneComposerSlashCommand,
 } from "../composer-logic";
 import {
@@ -276,6 +277,7 @@ import { PullRequestDetailGhost } from "./pullRequest/PullRequestGhosts";
 import { PullRequestsUnavailableState } from "./pullRequest/PullRequestsUnavailableState";
 import { RightPanelTabs } from "./RightPanelTabs";
 import { LinkPullRequestDialogHost } from "./pullRequest/LinkPullRequestDialog";
+import { McpServersDialogHost, openMcpServersDialog } from "./chat/McpServersDialog";
 import { ThreadPullRequestsPanel } from "./pullRequest/ThreadPullRequestsPanel";
 import { useDeviceState } from "~/state/device";
 import { DeviceSetup } from "./device/DeviceSetup";
@@ -3206,6 +3208,15 @@ export default function ChatView(props: ChatViewProps) {
   const supportsConversationRollback =
     conversationProviderStatus !== null &&
     conversationProviderStatus.supportsConversationRollback !== false;
+  // T3 answers /mcp itself where the thread's live provider manages its MCP servers; elsewhere
+  // the name stays the provider's own and is sent through untouched.
+  const mcpServersOffered =
+    activeThreadId !== null && conversationProviderStatus?.supportsMcpManagement === true;
+  const activeThreadEnvironmentId = activeThread?.environmentId ?? null;
+  const openMcpServers = useCallback(() => {
+    if (activeThreadEnvironmentId === null || activeThreadId === null) return;
+    openMcpServersDialog(scopeThreadRef(activeThreadEnvironmentId, activeThreadId));
+  }, [activeThreadEnvironmentId, activeThreadId]);
   const phase = derivePhase(activeRuntime);
   const pendingRequests = useMemo(
     () =>
@@ -8367,6 +8378,18 @@ export default function ChatView(props: ChatViewProps) {
       }
       return;
     }
+    if (
+      mcpServersOffered &&
+      !directAnnotation &&
+      !composerHasNonPromptContent &&
+      isMcpServersCommand(promptRef.current)
+    ) {
+      openMcpServers();
+      promptRef.current = "";
+      setComposerDraftPrompt(composerDraftTarget, "");
+      composerRef.current?.resetCursorState();
+      return;
+    }
 
     const notifyDirectAnnotationAttached = () => {
       if (!directAnnotation) return;
@@ -11239,6 +11262,11 @@ export default function ChatView(props: ChatViewProps) {
                                   ? openUsageLimits
                                   : undefined
                               }
+                              onMcpServersCommand={
+                                mcpServersOffered && !composerHasNonPromptContent
+                                  ? openMcpServers
+                                  : undefined
+                              }
                               environmentUnavailable={activeEnvironmentUnavailableState}
                               activePendingApproval={activePendingApproval}
                               pendingApprovals={pendingApprovals}
@@ -11627,6 +11655,7 @@ export default function ChatView(props: ChatViewProps) {
         </AlertDialogPopup>
       </AlertDialog>
       <LinkPullRequestDialogHost />
+      <McpServersDialogHost />
       {expandedImage && (
         <ExpandedImageDialog
           key={expandedImageKey(expandedImage)}

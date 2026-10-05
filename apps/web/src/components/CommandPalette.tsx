@@ -59,6 +59,7 @@ import {
   MonitorIcon,
   MoonIcon,
   PaletteIcon,
+  PlugIcon,
   RotateCcwIcon,
   SettingsIcon,
   SquarePenIcon,
@@ -187,6 +188,7 @@ import { Checkbox } from "./ui/checkbox";
 import { ProjectFavicon } from "./ProjectFavicon";
 import { ProjectFilePicker } from "./files/ProjectFilePicker";
 import { openLinkPullRequestDialog } from "./pullRequest/LinkPullRequestDialog";
+import { openMcpServersDialog } from "./chat/McpServersDialog";
 import { ProjectContentSearchDialog } from "./search/ProjectContentSearchDialog";
 import { toggleThemeEditorForTheme } from "./settings/themeEditorStore";
 import { searchSettings, SETTINGS_SECTION_LABELS } from "./settings/settingsSearch";
@@ -2016,6 +2018,22 @@ function OpenCommandPaletteDialog(props: {
         if (refreshed._tag === "Failure") throw squashAtomCommandFailure(refreshed);
       },
     });
+    // The live session's provider decides, like /mcp in the composer.
+    const liveProvider = providerEntryByEnvironmentAndInstanceId.get(
+      `${thread.environmentId}:${thread.runtime?.providerInstanceId ?? thread.modelSelection.instanceId}`,
+    );
+    if (liveProvider?.snapshot.supportsMcpManagement === true) {
+      actionItems.push({
+        kind: "action",
+        value: "action:manage-mcp-servers",
+        searchTerms: ["mcp", "servers", "connectors", "tools", "authenticate", "sign in"],
+        title: "Manage MCP servers",
+        icon: <PlugIcon className={ITEM_ICON_CLASS} />,
+        run: async () => {
+          openMcpServersDialog(scopeThreadRef(thread.environmentId, thread.id));
+        },
+      });
+    }
   }
 
   actionItems.push({

@@ -61,6 +61,20 @@ Claude Code holds the turn until that window reopens, so it can keep showing as
 working. Wait for the reset, or stop the turn and continue later. The warning's
 timestamp shows when the displayed wait started.
 
+## MCP servers
+
+On web and desktop, send `/mcp` in a Claude thread, or choose **Manage MCP servers** in the
+command palette, to see the MCP servers of the thread's Claude session. From there you can
+reconnect a server, disable or enable it, sign in, or sign out. This works only while Claude is
+running for the thread; if it is not, send a message first. Servers you add to or remove from
+Claude Code's configuration appear after **Restart agent session**.
+
+Signing in opens the server's sign-in page in your browser, and the server connects once you
+approve access. If T3 Code runs on another machine, such as over a remote connection or T3
+Connect, the browser ends on a `localhost` page that does not load. Copy that page's address and
+paste it into the field under the server. For claude.ai connectors, approve access in the browser,
+then choose **Reconnect**.
+
 ## Skills
 
 Claude skills come from the config directory's `skills` folder and the project's

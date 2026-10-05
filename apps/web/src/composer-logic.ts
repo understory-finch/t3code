@@ -12,7 +12,7 @@ import {
 import { resolveShortcutCommand, type ShortcutEventLike } from "./keybindings";
 
 export type ComposerTriggerKind = "path" | "pull-request" | "slash-command" | "skill";
-export type ComposerSlashCommand = "model" | "plan" | "default";
+export type ComposerSlashCommand = "model" | "plan" | "default" | "mcp";
 export type ComposerSubmissionIntent = "foreground" | "background" | "alternate";
 
 export interface ComposerTrigger {
@@ -305,7 +305,7 @@ export function composerStateAtPromptEnd(text: string): {
 
 export function parseStandaloneComposerSlashCommand(
   text: string,
-): Exclude<ComposerSlashCommand, "model"> | null {
+): Exclude<ComposerSlashCommand, "model" | "mcp"> | null {
   const match = /^\/(plan|default)\s*$/i.exec(text.trim());
   if (!match) {
     return null;
@@ -313,6 +313,20 @@ export function parseStandaloneComposerSlashCommand(
   const command = match[1]?.toLowerCase();
   if (command === "plan") return "plan";
   return "default";
+}
+
+/** `/mcp` opens the MCP servers dialog without sending a turn; with arguments it stays a prompt. */
+export function isMcpServersCommand(prompt: string): boolean {
+  return prompt.trim().toLowerCase() === "/mcp";
+}
+
+/** Whether the prompt holds nothing but the slash command being typed. */
+export function slashTriggerStandsAlone(prompt: string, trigger: ComposerTrigger | null): boolean {
+  return (
+    trigger?.kind === "slash-command" &&
+    prompt.slice(0, trigger.rangeStart).trim() === "" &&
+    prompt.slice(trigger.rangeEnd).trim() === ""
+  );
 }
 
 export function replaceTextRange(
