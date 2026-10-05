@@ -1,4 +1,9 @@
-import type { OrchestrationV2HistoricalMessage } from "@t3tools/contracts";
+import type {
+  OrchestrationV2HistoricalMessage,
+  ProviderMcpActionInput,
+  ProviderMcpActionResult,
+  ProviderMcpServer,
+} from "@t3tools/contracts";
 import {
   ChatAttachment,
   CheckpointId,
@@ -354,6 +359,34 @@ export class ProviderAdapterProtocolError extends Schema.TaggedError<ProviderAda
   }
 }
 
+export class ProviderAdapterMcpError extends Schema.TaggedError<ProviderAdapterMcpError>()(
+  "ProviderAdapterMcpError",
+  {
+    driver: ProviderDriverKind,
+    reason: Schema.Literals([
+      "session-not-running",
+      "server-not-found",
+      "action-unavailable",
+      "provider-failure",
+    ]),
+    serverName: Schema.optional(Schema.String),
+    cause: Schema.optional(Schema.Defect()),
+  },
+) {
+  override get message(): string {
+    switch (this.reason) {
+      case "session-not-running":
+        return `${this.driver} has no live session for this provider thread.`;
+      case "server-not-found":
+        return `${this.driver} has no MCP server named ${this.serverName}.`;
+      case "action-unavailable":
+        return `${this.driver} MCP server ${this.serverName} does not accept that action now.`;
+      case "provider-failure":
+        return `${this.driver} failed to manage its MCP servers.`;
+    }
+  }
+}
+
 export const ProviderAdapterV2Error = Schema.Union([
   ProviderAdapterCapabilitiesError,
   ProviderAdapterOpenSessionError,
@@ -370,6 +403,7 @@ export const ProviderAdapterV2Error = Schema.Union([
   ProviderAdapterRuntimeRequestResponseError,
   ProviderAdapterEventStreamError,
   ProviderAdapterProtocolError,
+  ProviderAdapterMcpError,
 ]);
 export type ProviderAdapterV2Error = typeof ProviderAdapterV2Error.Type;
 
@@ -481,6 +515,24 @@ export interface ProviderAdapterV2HistoricalContext {
   readonly context: string;
 }
 
+/**
+ * The MCP servers of a provider thread's live native process. `session-not-running`
+ * means no such process exists right now; adapters never start one just to answer.
+ */
+export interface ProviderAdapterV2McpControls {
+  readonly list: (input: {
+    readonly providerThread: OrchestrationV2ProviderThread;
+  }) => Effect.Effect<ReadonlyArray<ProviderMcpServer>, ProviderAdapterMcpError>;
+  /** Enforces the server's advertised actions and returns the servers as they are afterwards. */
+  readonly act: (
+    input: ProviderAdapterV2McpActionInput,
+  ) => Effect.Effect<ProviderMcpActionResult, ProviderAdapterMcpError>;
+}
+
+export type ProviderAdapterV2McpActionInput = ProviderMcpActionInput & {
+  readonly providerThread: OrchestrationV2ProviderThread;
+};
+
 export interface ProviderAdapterV2SessionRuntime {
   readonly instanceId: ProviderInstanceId;
   readonly driver: ProviderDriverKind;
@@ -570,6 +622,12 @@ export interface ProviderAdapterV2SessionRuntime {
     readonly providerThread: OrchestrationV2ProviderThread;
     readonly reason?: string;
   }) => Effect.Effect<{ readonly feedbackId: string }, ProviderAdapterV2Error>;
+  /**
+   * Absent means the driver cannot manage MCP servers from T3. Only Claude
+   * implements it for now; Codex, Cursor, Grok, OpenCode, Pi and ACP agents
+   * leave it out.
+   */
+  readonly mcp?: ProviderAdapterV2McpControls;
   readonly rollbackThread: (
     input: ProviderAdapterV2RollbackThreadInput,
   ) => Effect.Effect<ProviderAdapterV2ThreadSnapshot, ProviderAdapterV2Error>;

@@ -32,6 +32,7 @@ import { layer as projectionMaintenanceLayer } from "./ProjectionMaintenance.ts"
 import * as ProjectStore from "./ProjectStore.ts";
 import { layerFromProviderInstanceRegistry as providerAdapterRegistryLayerFromProviderInstances } from "./ProviderAdapterRegistry.ts";
 import { layer as providerContinuationRequestsLayer } from "./ProviderContinuationRequests.ts";
+import * as ProviderMcpService from "./ProviderMcpService.ts";
 import { workerLive as providerContinuationWorkerLive } from "./ProviderContinuationService.ts";
 import { layer as threadTitleRegenerationServiceLayer } from "./ThreadTitleRegenerationService.ts";
 import { layer as providerEventIngestorLayer } from "./ProviderEventIngestor.ts";
@@ -159,6 +160,10 @@ const providerTurnStartServiceProvided = providerTurnStartServiceLayer.pipe(
       runtimePolicyProvided,
     ),
   ),
+);
+
+const providerMcpServiceProvided = ProviderMcpService.layer.pipe(
+  Layer.provide(Layer.merge(projectionStoreLayer, providerSessionManagerProvided)),
 );
 
 const providerTurnControlServiceProvided = providerTurnControlServiceLayer.pipe(
@@ -302,6 +307,7 @@ export const OrchestrationV2LayerLive = Layer.mergeAll(
   effectWorkerProvided,
   providerSessionManagerProvided,
   providerAuthServiceProvided,
+  providerMcpServiceProvided,
   providerRuntimeRecoveryProvided,
   projectionMaintenanceProvided,
   legacyV1ThreadImporterProvided,

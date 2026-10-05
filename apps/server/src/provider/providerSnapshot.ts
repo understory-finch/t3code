@@ -69,6 +69,7 @@ export interface ServerProviderPresentation {
   readonly supportedRuntimeModes?: ReadonlyArray<RuntimeMode>;
   readonly requiresNewThreadForModelChange?: boolean;
   readonly supportsConversationRollback?: boolean;
+  readonly supportsMcpManagement?: boolean;
 }
 
 export type ServerProviderDraft = Omit<ServerProvider, "instanceId" | "driver">;
@@ -233,6 +234,9 @@ export function buildServerProvider(input: {
       : { supportedRuntimeModes: [...input.presentation.supportedRuntimeModes] }),
     ...(typeof input.presentation.requiresNewThreadForModelChange === "boolean"
       ? { requiresNewThreadForModelChange: input.presentation.requiresNewThreadForModelChange }
+      : {}),
+    ...(typeof input.presentation.supportsMcpManagement === "boolean"
+      ? { supportsMcpManagement: input.presentation.supportsMcpManagement }
       : {}),
     enabled: input.enabled,
     installed: input.probe.installed,

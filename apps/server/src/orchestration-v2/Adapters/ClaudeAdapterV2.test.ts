@@ -1,6 +1,7 @@
 import * as NodeOS from "node:os";
 
 import type {
+  McpServerStatus,
   Query as ClaudeQuery,
   SDKMessage,
   SDKResultMessage,
@@ -21,6 +22,7 @@ import {
   type OrchestrationV2ProviderThread,
   ProjectId,
   ProviderInstanceId,
+  ProviderMcpListResult,
   type ProviderApprovalDecision,
   ProviderSessionId,
   ProviderTurnId,
@@ -1024,6 +1026,394 @@ describe("ClaudeAdapterV2 Auto-accept edits", () => {
           decision: "accept",
         });
         assert.equal((yield* Fiber.join(decision))?.behavior, "allow");
+      }).pipe(Effect.provide(Layer.merge(IdAllocator.layer, NodeServices.layer))),
+    ),
+  );
+});
+
+const encodeProviderMcpListJson = Schema.encodeEffect(Schema.fromJsonString(ProviderMcpListResult));
+
+describe("ClaudeAdapterV2 MCP server management", () => {
+  const t3Server: McpServerStatus = {
+    name: ClaudeAdapterV2.CLAUDE_T3_MCP_SERVER_NAME,
+    status: "connected",
+    scope: "dynamic",
+    source: "dynamic",
+    config: {
+      type: "http",
+      url: "http://127.0.0.1:4100/mcp",
+      headers: { Authorization: "Bearer t3-secret-token" },
+    },
+    tools: [{ name: "t3_thread_list" }],
+  };
+  const linearServer: McpServerStatus = {
+    name: "linear",
+    status: "needs-auth",
+    scope: "user",
+    source: "user",
+    config: {
+      type: "http",
+      url: "https://user:hunter2@mcp.linear.app/mcp?api_key=linear-secret#section",
+      headers: { "X-Api-Key": "linear-header-secret" },
+    },
+  };
+  const claudeAiServer: McpServerStatus = {
+    name: "claude.ai Gmail",
+    status: "needs-auth",
+    scope: "claudeai",
+    source: "claudeai",
+    config: { type: "claudeai-proxy", url: "https://claude.ai/api/mcp/gmail", id: "gmail" },
+  };
+
+  // Stands in for the CLI: records every control request and lets enable
+  // and disable change what the next status read reports.
+  const makeMcpHarness = Effect.fnUntraced(function* (input: {
+    readonly servers: ReadonlyArray<McpServerStatus>;
+    readonly authStarts?: Readonly<
+      Record<string, { readonly authUrl: string | null; readonly callbackExpected: boolean }>
+    >;
+  }) {
+    const fileSystem = yield* FileSystem.FileSystem;
+    const idAllocator = yield* IdAllocator.IdAllocatorV2;
+    const attachmentsDir = yield* fileSystem.makeTempDirectoryScoped({ prefix: "t3-claude-mcp-" });
+    let servers = input.servers;
+    const calls: Array<string> = [];
+    const record = (call: string) =>
+      Effect.sync(() => {
+        calls.push(call);
+      });
+    const controls: ClaudeAdapterV2.ClaudeAgentSdkMcpControls = {
+      status: Effect.sync(() => servers),
+      reconnect: (name) => record(`reconnect ${name}`),
+      toggle: (name, enabled) =>
+        record(`toggle ${name} ${enabled}`).pipe(
+          Effect.tap(() =>
+            Effect.sync(() => {
+              servers = servers.map((server): McpServerStatus =>
+                server.name === name
+                  ? { ...server, status: enabled ? "pending" : "disabled" }
+                  : server,
+              );
+            }),
+          ),
+        ),
+      authenticate: (name) =>
+        record(`authenticate ${name}`).pipe(
+          Effect.as(input.authStarts?.[name] ?? { authUrl: null, callbackExpected: false }),
+        ),
+      submitOAuthCallbackUrl: (name, callbackUrl) => record(`callback ${name} ${callbackUrl}`),
+      clearAuth: (name) => record(`clear-auth ${name}`),
+    };
+    const adapter = ClaudeAdapterV2.makeClaudeAdapterV2({
+      instanceId: ClaudeAdapterV2.CLAUDE_DEFAULT_INSTANCE_ID,
+      settings: DEFAULT_CLAUDE_SETTINGS,
+      environment: {},
+      attachmentsDir,
+      fileSystem,
+      path: yield* Path.Path,
+      idAllocator,
+      queryRunner: {
+        allocateSessionId: Effect.succeed("native-thread-claude-mcp"),
+        open: () =>
+          Effect.succeed({
+            messages: Stream.never,
+            offer: () => Effect.void,
+            setModel: () => Effect.void,
+            setPermissionMode: () => Effect.void,
+            interrupt: Effect.void,
+            close: Effect.void,
+            mcp: controls,
+          }),
+        forkSession: () => Effect.die("unused"),
+        subagentLaunchToolUseId: () => Effect.succeed(null),
+        assertComplete: Effect.void,
+      },
+    });
+    const threadId = ThreadId.make("thread-claude-mcp");
+    const runtime = yield* adapter.openSession({
+      threadId,
+      providerSessionId: ProviderSessionId.make("provider-session-claude-mcp"),
+      modelSelection: CLAUDE_TEST_MODEL_SELECTION,
+      runtimePolicy: CLAUDE_TEST_RUNTIME_POLICY,
+    });
+    const providerThread = yield* runtime.ensureThread({
+      threadId,
+      modelSelection: CLAUDE_TEST_MODEL_SELECTION,
+      runtimePolicy: CLAUDE_TEST_RUNTIME_POLICY,
+    });
+    const mcp = runtime.mcp;
+    if (mcp === undefined) {
+      return yield* Effect.die("The Claude runtime exposes no MCP controls.");
+    }
+    const startTurn = runtime.startTurn(
+      makeClaudeTestTurnInput({
+        threadId,
+        providerThread,
+        now: yield* DateTime.now,
+        attemptId: RunAttemptId.make("attempt-claude-mcp"),
+        text: "Hello.",
+        attachments: [],
+      }),
+    );
+    return { mcp, providerThread, threadId, startTurn, calls };
+  });
+
+  it.effect("answers only while the thread's own Claude query is live", () =>
+    Effect.scoped(
+      Effect.gen(function* () {
+        const harness = yield* makeMcpHarness({ servers: [t3Server] });
+        const beforeTurn = yield* harness.mcp
+          .list({ providerThread: harness.providerThread })
+          .pipe(Effect.flip);
+        assert.equal(beforeTurn.reason, "session-not-running");
+
+        yield* harness.startTurn;
+        const listed = yield* harness.mcp.list({ providerThread: harness.providerThread });
+        assert.deepEqual(
+          listed.map((server) => server.name),
+          [ClaudeAdapterV2.CLAUDE_T3_MCP_SERVER_NAME],
+        );
+
+        const otherThread = yield* harness.mcp
+          .list({
+            providerThread: {
+              ...harness.providerThread,
+              nativeThreadRef: {
+                driver: ClaudeAdapterV2.CLAUDE_PROVIDER,
+                nativeId: "native-thread-elsewhere",
+                strength: "strong",
+              },
+            },
+          })
+          .pipe(Effect.flip);
+        assert.equal(otherThread.reason, "session-not-running");
+      }).pipe(Effect.provide(Layer.merge(IdAllocator.layer, NodeServices.layer))),
+    ),
+  );
+
+  it.effect("maps live status without forwarding server configuration", () =>
+    Effect.scoped(
+      Effect.gen(function* () {
+        const harness = yield* makeMcpHarness({
+          servers: [
+            t3Server,
+            linearServer,
+            claudeAiServer,
+            {
+              name: "files",
+              status: "connected",
+              scope: "project",
+              config: {
+                command: "npx",
+                args: ["files-mcp"],
+                env: { FILES_TOKEN: "files-env-secret" },
+              },
+              tools: [{ name: "read" }, { name: "write" }],
+            },
+            {
+              name: "notion",
+              status: "failed",
+              source: "plugin",
+              error: `  ${"Connection refused. ".repeat(100)}`,
+              config: { type: "sse", url: "https://mcp.notion.com/sse" },
+            },
+            { name: "sentry", status: "disabled", source: "user" },
+            // A status this SDK version does not declare.
+            { name: "future", status: "reauthorizing" as never, source: "user" },
+          ],
+        });
+        yield* harness.startTurn;
+
+        const servers = yield* harness.mcp.list({ providerThread: harness.providerThread });
+        const notionError = servers.find((server) => server.name === "notion")?.error ?? "";
+        assert.isAtMost(notionError.length, 1_000);
+        assert.isTrue(notionError.startsWith("Connection refused."));
+        assert.deepEqual(
+          servers.map((server) => (server.name === "notion" ? { ...server, error: "…" } : server)),
+          [
+            {
+              name: ClaudeAdapterV2.CLAUDE_T3_MCP_SERVER_NAME,
+              status: "connected",
+              source: "dynamic",
+              transport: "http",
+              url: "http://127.0.0.1:4100/mcp",
+              toolCount: 1,
+              managed: true,
+              actions: [],
+            },
+            {
+              name: "linear",
+              status: "needs-auth",
+              source: "user",
+              transport: "http",
+              url: "https://mcp.linear.app/mcp",
+              managed: false,
+              actions: ["reconnect", "disable", "authenticate"],
+            },
+            {
+              name: "claude.ai Gmail",
+              status: "needs-auth",
+              source: "claudeai",
+              transport: "claudeai-proxy",
+              managed: false,
+              actions: ["reconnect", "disable", "authenticate"],
+            },
+            {
+              name: "files",
+              status: "connected",
+              source: "project",
+              transport: "stdio",
+              toolCount: 2,
+              managed: false,
+              actions: ["reconnect", "disable"],
+            },
+            {
+              name: "notion",
+              status: "failed",
+              source: "plugin",
+              transport: "sse",
+              url: "https://mcp.notion.com/sse",
+              error: "…",
+              managed: false,
+              actions: ["reconnect", "disable", "clear-auth"],
+            },
+            {
+              name: "sentry",
+              status: "disabled",
+              source: "user",
+              managed: false,
+              actions: ["enable"],
+            },
+            {
+              name: "future",
+              status: "failed",
+              source: "user",
+              error: 'Claude reported an unknown status "reauthorizing".',
+              managed: false,
+              actions: ["reconnect", "disable"],
+            },
+          ],
+        );
+        const wire = yield* encodeProviderMcpListJson({ servers });
+        for (const secret of [
+          "t3-secret-token",
+          "hunter2",
+          "linear-secret",
+          "linear-header-secret",
+          "files-env-secret",
+        ]) {
+          assert.notInclude(wire, secret);
+        }
+      }).pipe(Effect.provide(Layer.merge(IdAllocator.layer, NodeServices.layer))),
+    ),
+  );
+
+  it.effect("refuses actions a server does not offer before asking Claude", () =>
+    Effect.scoped(
+      Effect.gen(function* () {
+        const harness = yield* makeMcpHarness({
+          servers: [
+            t3Server,
+            { ...linearServer, status: "connected" },
+            { name: "sentry", status: "disabled", source: "user" },
+          ],
+        });
+        yield* harness.startTurn;
+        const act = (serverName: string, action: "disable" | "authenticate" | "enable") =>
+          harness.mcp.act({
+            threadId: harness.threadId,
+            providerThread: harness.providerThread,
+            serverName,
+            action,
+          });
+
+        for (const [serverName, action] of [
+          [ClaudeAdapterV2.CLAUDE_T3_MCP_SERVER_NAME, "disable"],
+          ["linear", "authenticate"],
+          ["sentry", "disable"],
+        ] as const) {
+          const refused = yield* act(serverName, action).pipe(Effect.flip);
+          assert.equal(refused.reason, "action-unavailable", `${action} ${serverName}`);
+        }
+        const unknown = yield* act("missing", "disable").pipe(Effect.flip);
+        assert.equal(unknown.reason, "server-not-found");
+        const managedCallback = yield* harness.mcp
+          .act({
+            threadId: harness.threadId,
+            providerThread: harness.providerThread,
+            serverName: ClaudeAdapterV2.CLAUDE_T3_MCP_SERVER_NAME,
+            action: "submit-oauth-callback",
+            callbackUrl: "http://localhost:4567/callback?code=abc",
+          })
+          .pipe(Effect.flip);
+        assert.equal(managedCallback.reason, "action-unavailable");
+        assert.deepEqual(harness.calls, []);
+
+        const enabled = yield* act("sentry", "enable");
+        assert.deepEqual(harness.calls, ["toggle sentry true"]);
+        assert.equal(enabled.servers.find((server) => server.name === "sentry")?.status, "pending");
+        assert.isUndefined(enabled.auth);
+      }).pipe(Effect.provide(Layer.merge(IdAllocator.layer, NodeServices.layer))),
+    ),
+  );
+
+  it.effect("returns the sign-in link and whether its redirect can be pasted back", () =>
+    Effect.scoped(
+      Effect.gen(function* () {
+        const harness = yield* makeMcpHarness({
+          servers: [
+            linearServer,
+            claudeAiServer,
+            { name: "quiet", status: "needs-auth", source: "user" },
+            { name: "hostile", status: "needs-auth", source: "user" },
+          ],
+          authStarts: {
+            linear: {
+              authUrl: "https://linear.app/oauth/authorize?redirect_uri=http://localhost:4567",
+              callbackExpected: true,
+            },
+            "claude.ai Gmail": {
+              authUrl: "https://claude.ai/api/organizations/org/mcp/start-auth/gmail",
+              callbackExpected: false,
+            },
+            hostile: { authUrl: "javascript:alert(1)", callbackExpected: true },
+          },
+        });
+        yield* harness.startTurn;
+        const authenticate = (serverName: string) =>
+          harness.mcp.act({
+            threadId: harness.threadId,
+            providerThread: harness.providerThread,
+            serverName,
+            action: "authenticate",
+          });
+
+        assert.deepEqual((yield* authenticate("linear")).auth, {
+          url: "https://linear.app/oauth/authorize?redirect_uri=http://localhost:4567",
+          acceptsCallback: true,
+        });
+        assert.deepEqual((yield* authenticate("claude.ai Gmail")).auth, {
+          url: "https://claude.ai/api/organizations/org/mcp/start-auth/gmail",
+          acceptsCallback: false,
+        });
+        assert.isUndefined((yield* authenticate("quiet")).auth);
+        const hostile = yield* authenticate("hostile").pipe(Effect.flip);
+        assert.equal(hostile.reason, "provider-failure");
+
+        yield* harness.mcp.act({
+          threadId: harness.threadId,
+          providerThread: harness.providerThread,
+          serverName: "linear",
+          action: "submit-oauth-callback",
+          callbackUrl: "http://localhost:4567/callback?code=abc&state=xyz",
+        });
+        assert.deepEqual(harness.calls, [
+          "authenticate linear",
+          "authenticate claude.ai Gmail",
+          "authenticate quiet",
+          "authenticate hostile",
+          "callback linear http://localhost:4567/callback?code=abc&state=xyz",
+        ]);
       }).pipe(Effect.provide(Layer.merge(IdAllocator.layer, NodeServices.layer))),
     ),
   );

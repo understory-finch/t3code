@@ -51,6 +51,13 @@ describe("RPC authorization scopes", () => {
     );
   });
 
+  it("lets readers see MCP servers but only operators change or sign in to them", () => {
+    expect(requiredScopeForRpcMethod(WS_METHODS.providerMcpList)).toBe(AuthOrchestrationReadScope);
+    expect(requiredScopeForRpcMethod(WS_METHODS.providerMcpAction)).toBe(
+      AuthOrchestrationOperateScope,
+    );
+  });
+
   it("requires write access to import agent session history", () => {
     expect(requiredScopeForRpcMethod(WS_METHODS.agentSessionsScan)).toBe(
       AuthOrchestrationReadScope,

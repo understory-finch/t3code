@@ -195,6 +195,10 @@
       "types": "./src/state/providerInstanceDisplay.ts",
       "default": "./src/state/providerInstanceDisplay.ts"
     },
+    "./state/provider-mcp": {
+      "types": "./src/state/providerMcp.ts",
+      "default": "./src/state/providerMcp.ts"
+    },
     "./state/pull-requests": {
       "types": "./src/state/pullRequests.ts",
       "default": "./src/state/pullRequests.ts"

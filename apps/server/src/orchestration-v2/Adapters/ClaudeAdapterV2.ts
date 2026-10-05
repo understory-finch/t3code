@@ -14,6 +14,7 @@ import {
   type ForkSessionOptions,
   type ForkSessionResult,
   getSubagentMessages,
+  type McpServerStatus,
   query,
   type Options as ClaudeQueryOptions,
   type PermissionMode,
@@ -63,6 +64,10 @@ import {
   type ProviderApprovalDecision,
   ProviderDriverKind,
   type ProviderInstanceId,
+  type ProviderMcpActionResult,
+  type ProviderMcpServer,
+  type ProviderMcpServerAction,
+  ProviderMcpServerStatus,
   type ProviderRequestKind,
   type ProviderUserInputAnswers,
   type ProviderThreadId,
@@ -332,6 +337,33 @@ export interface ClaudeAgentSdkQuerySession {
   ) => Effect.Effect<void, ClaudeAgentSdkQueryRunnerError>;
   readonly interrupt: Effect.Effect<void, ClaudeAgentSdkQueryRunnerError>;
   readonly close: Effect.Effect<void, ClaudeAgentSdkQueryRunnerError>;
+  /** Optional so sessions that never manage MCP servers, such as test fakes, can omit it. */
+  readonly mcp?: ClaudeAgentSdkMcpControls;
+}
+
+export interface ClaudeAgentSdkMcpControls {
+  readonly status: Effect.Effect<ReadonlyArray<McpServerStatus>, ClaudeAgentSdkQueryRunnerError>;
+  readonly reconnect: (serverName: string) => Effect.Effect<void, ClaudeAgentSdkQueryRunnerError>;
+  readonly toggle: (
+    serverName: string,
+    enabled: boolean,
+  ) => Effect.Effect<void, ClaudeAgentSdkQueryRunnerError>;
+  /**
+   * Starts a sign-in whose redirect lands on the CLI's own localhost listener.
+   * `callbackExpected` is false for claude.ai connectors, which finish on claude.ai.
+   */
+  readonly authenticate: (serverName: string) => Effect.Effect<
+    {
+      readonly authUrl: string | null;
+      readonly callbackExpected: boolean;
+    },
+    ClaudeAgentSdkQueryRunnerError
+  >;
+  readonly submitOAuthCallbackUrl: (
+    serverName: string,
+    callbackUrl: string,
+  ) => Effect.Effect<void, ClaudeAgentSdkQueryRunnerError>;
+  readonly clearAuth: (serverName: string) => Effect.Effect<void, ClaudeAgentSdkQueryRunnerError>;
 }
 
 type ClaudeQueryStreamExit = Exit.Exit<void, ClaudeAgentSdkQueryRunnerError>;
@@ -399,6 +431,7 @@ const isProviderAdapterRuntimeRequestResponseError = Schema.is(
 const isProviderAdapterRollbackThreadError = Schema.is(
   ProviderAdapter.ProviderAdapterRollbackThreadError,
 );
+const isProviderAdapterMcpError = Schema.is(ProviderAdapter.ProviderAdapterMcpError);
 
 function queryRunnerError(cause: unknown, method: string): ClaudeAgentSdkQueryRunnerError {
   return isClaudeAgentSdkQueryRunnerError(cause)
@@ -489,6 +522,44 @@ export type ClaudeAgentSdkProtocolLogEvent =
       readonly stage: "decoded";
       readonly payload: {
         readonly type: "query.close";
+      };
+    }
+  | {
+      readonly direction: "outgoing";
+      readonly stage: "decoded";
+      readonly payload: {
+        readonly type: "query.mcp_status";
+      };
+    }
+  | {
+      readonly direction: "incoming";
+      readonly stage: "decoded";
+      // Names and statuses only: server configs carry headers and env secrets.
+      readonly payload: {
+        readonly type: "query.mcp_status";
+        readonly servers: ReadonlyArray<{ readonly name: string; readonly status: string }>;
+      };
+    }
+  | {
+      readonly direction: "outgoing";
+      readonly stage: "decoded";
+      // The OAuth callback URL carries an authorization code, so it is never logged.
+      readonly payload: {
+        readonly type:
+          | "query.mcp_reconnect"
+          | "query.mcp_authenticate"
+          | "query.mcp_oauth_callback_url"
+          | "query.mcp_clear_auth";
+        readonly serverName: string;
+      };
+    }
+  | {
+      readonly direction: "outgoing";
+      readonly stage: "decoded";
+      readonly payload: {
+        readonly type: "query.mcp_toggle";
+        readonly serverName: string;
+        readonly enabled: boolean;
       };
     }
   | {
@@ -588,6 +659,133 @@ export function makeClaudeAgentSdkProtocolLogger(input: {
         input.threadId,
       )
       .pipe(Effect.ignore);
+  };
+}
+
+// Present on the SDK's Query at runtime but missing from sdk.d.ts. An older
+// SDK or CLI may lack them, which has to fail the call instead of throwing.
+interface ClaudeQueryMcpAuthMethods {
+  mcpAuthenticate(serverName: string, redirectUri?: string): Promise<unknown>;
+  mcpSubmitOAuthCallbackUrl(serverName: string, callbackUrl: string): Promise<unknown>;
+  mcpClearAuth(serverName: string): Promise<unknown>;
+}
+
+function hasClaudeQueryMcpAuthMethod<Method extends keyof ClaudeQueryMcpAuthMethods>(
+  queryRuntime: ClaudeQuery,
+  method: Method,
+): queryRuntime is ClaudeQuery & Pick<ClaudeQueryMcpAuthMethods, Method> {
+  return typeof Reflect.get(queryRuntime, method) === "function";
+}
+
+function missingClaudeQueryMcpAuthMethod(method: keyof ClaudeQueryMcpAuthMethods) {
+  return Promise.reject(
+    new Error(`This Claude Agent SDK does not support ${method}. Update Claude Code.`),
+  );
+}
+
+const decodeClaudeMcpAuthenticateResponse = Schema.decodeUnknownEffect(
+  Schema.Struct({
+    authUrl: Schema.optional(Schema.NullOr(Schema.String)),
+    callbackExpected: Schema.Boolean,
+  }),
+);
+
+function makeClaudeAgentSdkMcpControls(
+  queryRuntime: ClaudeQuery,
+  logProtocolEvent: (event: ClaudeAgentSdkProtocolLogEvent) => Effect.Effect<void>,
+): ClaudeAgentSdkMcpControls {
+  const logServerEvent = (
+    type:
+      | "query.mcp_reconnect"
+      | "query.mcp_authenticate"
+      | "query.mcp_oauth_callback_url"
+      | "query.mcp_clear_auth",
+    serverName: string,
+  ) => logProtocolEvent({ direction: "outgoing", stage: "decoded", payload: { type, serverName } });
+  return {
+    status: logProtocolEvent({
+      direction: "outgoing",
+      stage: "decoded",
+      payload: { type: "query.mcp_status" },
+    }).pipe(
+      Effect.andThen(
+        Effect.tryPromise({
+          try: () => queryRuntime.mcpServerStatus(),
+          catch: (cause) => queryRunnerError(cause, "mcpServerStatus"),
+        }),
+      ),
+      Effect.tap((servers) =>
+        logProtocolEvent({
+          direction: "incoming",
+          stage: "decoded",
+          payload: {
+            type: "query.mcp_status",
+            servers: servers.map((server) => ({ name: server.name, status: server.status })),
+          },
+        }),
+      ),
+    ),
+    reconnect: (serverName) =>
+      Effect.tryPromise({
+        try: () => queryRuntime.reconnectMcpServer(serverName),
+        catch: (cause) => queryRunnerError(cause, "reconnectMcpServer"),
+      }).pipe(Effect.tap(() => logServerEvent("query.mcp_reconnect", serverName))),
+    toggle: (serverName, enabled) =>
+      Effect.tryPromise({
+        try: () => queryRuntime.toggleMcpServer(serverName, enabled),
+        catch: (cause) => queryRunnerError(cause, "toggleMcpServer"),
+      }).pipe(
+        Effect.tap(() =>
+          logProtocolEvent({
+            direction: "outgoing",
+            stage: "decoded",
+            payload: { type: "query.mcp_toggle", serverName, enabled },
+          }),
+        ),
+      ),
+    authenticate: (serverName) =>
+      Effect.tryPromise({
+        // No redirectUri: the CLI then listens on localhost itself, and
+        // remote browsers paste the final URL back instead.
+        try: () =>
+          hasClaudeQueryMcpAuthMethod(queryRuntime, "mcpAuthenticate")
+            ? queryRuntime.mcpAuthenticate(serverName)
+            : missingClaudeQueryMcpAuthMethod("mcpAuthenticate"),
+        catch: (cause) => queryRunnerError(cause, "mcpAuthenticate"),
+      }).pipe(
+        Effect.flatMap((response) =>
+          decodeClaudeMcpAuthenticateResponse(response).pipe(
+            Effect.mapError((cause) => queryRunnerError(cause, "mcpAuthenticate")),
+          ),
+        ),
+        Effect.map((response) => ({
+          authUrl: response.authUrl ?? null,
+          callbackExpected: response.callbackExpected,
+        })),
+        Effect.tap(() => logServerEvent("query.mcp_authenticate", serverName)),
+      ),
+    submitOAuthCallbackUrl: (serverName, callbackUrl) =>
+      Effect.tryPromise({
+        try: () =>
+          hasClaudeQueryMcpAuthMethod(queryRuntime, "mcpSubmitOAuthCallbackUrl")
+            ? queryRuntime.mcpSubmitOAuthCallbackUrl(serverName, callbackUrl)
+            : missingClaudeQueryMcpAuthMethod("mcpSubmitOAuthCallbackUrl"),
+        catch: (cause) => queryRunnerError(cause, "mcpSubmitOAuthCallbackUrl"),
+      }).pipe(
+        Effect.asVoid,
+        Effect.tap(() => logServerEvent("query.mcp_oauth_callback_url", serverName)),
+      ),
+    clearAuth: (serverName) =>
+      Effect.tryPromise({
+        try: () =>
+          hasClaudeQueryMcpAuthMethod(queryRuntime, "mcpClearAuth")
+            ? queryRuntime.mcpClearAuth(serverName)
+            : missingClaudeQueryMcpAuthMethod("mcpClearAuth"),
+        catch: (cause) => queryRunnerError(cause, "mcpClearAuth"),
+      }).pipe(
+        Effect.asVoid,
+        Effect.tap(() => logServerEvent("query.mcp_clear_auth", serverName)),
+      ),
   };
 }
 
@@ -723,6 +921,7 @@ export const claudeAgentSdkQueryRunnerLiveLayer: Layer.Layer<
               }),
             ),
           ),
+          mcp: makeClaudeAgentSdkMcpControls(queryRuntime, logProtocolEvent),
         } satisfies ClaudeAgentSdkQuerySession;
       }),
       forkSession: Effect.fn("ClaudeAgentSdkQueryRunner.forkSession")(function* (
@@ -922,6 +1121,8 @@ export function makeClaudeQueryOptions(input: {
   return input.cwd === null ? withDirectories : { ...withDirectories, cwd: input.cwd };
 }
 
+/** The MCP server T3 attaches to Claude queries to serve the agent its own tools. */
+export const CLAUDE_T3_MCP_SERVER_NAME = "t3-code";
 export const CLAUDE_T3_MCP_TOOL_WILDCARD = "mcp__t3-code__*";
 
 // Must stay in sync with the Tool.Readonly annotations on OrchestratorToolkit;
@@ -977,7 +1178,7 @@ export function claudeMcpQueryOverrides(input: {
   return {
     allowedTools: Array.from(new Set([...(input.allowedTools ?? []), ...mcpAllowedTools])),
     mcpServers: {
-      "t3-code": {
+      [CLAUDE_T3_MCP_SERVER_NAME]: {
         type: "http",
         url: session.endpoint,
         headers: {
@@ -987,6 +1188,101 @@ export function claudeMcpQueryOverrides(input: {
       },
     },
   };
+}
+
+const CLAUDE_MCP_ERROR_MAX_LENGTH = 1_000;
+const isProviderMcpServerStatus = Schema.is(ProviderMcpServerStatus);
+
+function boundedMcpText(value: string | undefined, maxLength: number): string | undefined {
+  const trimmed = value?.trim();
+  if (trimmed === undefined || trimmed.length === 0) return undefined;
+  return trimmed.length <= maxLength ? trimmed : `${trimmed.slice(0, maxLength - 1).trimEnd()}…`;
+}
+
+// Origin and path only: query strings and userinfo can carry API keys.
+function claudeMcpServerUrl(config: McpServerStatus["config"]): string | undefined {
+  if (config?.type !== "http" && config?.type !== "sse") return undefined;
+  const url = URL.parse(config.url);
+  if (url === null) return undefined;
+  const display = `${url.origin}${url.pathname}`;
+  return display.length <= 2_048 ? display : undefined;
+}
+
+// T3's own server carries the agent's T3 tools, so turning it off or signing
+// it out would cut the agent off from T3. The CLI reports servers T3 passes
+// in as "dynamic"; the name alone is not trusted. CLIs that predate
+// provenance report none, and T3 always attaches its server under this name.
+function isT3ManagedClaudeMcpServer(server: McpServerStatus): boolean {
+  if (server.name !== CLAUDE_T3_MCP_SERVER_NAME) return false;
+  const provenance = server.source ?? server.scope;
+  return provenance === undefined || provenance === "dynamic";
+}
+
+function claudeMcpServerActions(input: {
+  readonly managed: boolean;
+  readonly status: ProviderMcpServer["status"];
+  readonly transport: string | undefined;
+}): ReadonlyArray<ProviderMcpServerAction> {
+  if (input.managed) return [];
+  if (input.status === "disabled") return ["enable"];
+  const actions: Array<ProviderMcpServerAction> = ["reconnect", "disable"];
+  if (input.status === "needs-auth") actions.push("authenticate");
+  // Only remote servers hold OAuth tokens. A pending or signed-out server has
+  // nothing to clear yet.
+  if (
+    (input.transport === "http" || input.transport === "sse") &&
+    (input.status === "connected" || input.status === "failed")
+  ) {
+    actions.push("clear-auth");
+  }
+  return actions;
+}
+
+// Never forwards `config`: it holds request headers, T3's own bearer token
+// among them, and stdio env.
+function claudeMcpServer(server: McpServerStatus): ProviderMcpServer | undefined {
+  // A name the contract would trim or reject could not be addressed by an
+  // action afterwards.
+  if (server.name.length === 0 || server.name.length > 256 || server.name.trim() !== server.name) {
+    return undefined;
+  }
+  const reportedStatus: string = server.status;
+  const status = isProviderMcpServerStatus(reportedStatus) ? reportedStatus : "failed";
+  const transport =
+    server.config === undefined ? undefined : boundedMcpText(server.config.type ?? "stdio", 64);
+  const managed = isT3ManagedClaudeMcpServer(server);
+  const source = boundedMcpText(server.source ?? server.scope, 64);
+  const url = claudeMcpServerUrl(server.config);
+  const error = boundedMcpText(
+    status === reportedStatus
+      ? server.error
+      : `Claude reported an unknown status "${reportedStatus}". ${server.error ?? ""}`,
+    CLAUDE_MCP_ERROR_MAX_LENGTH,
+  );
+  return {
+    name: server.name,
+    status,
+    ...(source === undefined ? {} : { source }),
+    ...(transport === undefined ? {} : { transport }),
+    ...(url === undefined ? {} : { url }),
+    ...(server.tools === undefined ? {} : { toolCount: server.tools.length }),
+    ...(error === undefined ? {} : { error }),
+    managed,
+    actions: claudeMcpServerActions({ managed, status, transport }),
+  };
+}
+
+function claudeMcpServers(
+  servers: ReadonlyArray<McpServerStatus>,
+): ReadonlyArray<ProviderMcpServer> {
+  return servers.flatMap((server) => claudeMcpServer(server) ?? []);
+}
+
+// The sign-in URL comes from the MCP server's OAuth metadata, and clients open
+// it in a browser.
+function isOpenableClaudeMcpAuthUrl(url: string): boolean {
+  const protocol = URL.parse(url)?.protocol;
+  return url.length <= 16_384 && (protocol === "https:" || protocol === "http:");
 }
 
 function providerSession(input: {
@@ -7454,6 +7750,112 @@ export function makeClaudeAdapterV2(
         });
         yield* Effect.addFinalizer(() => closeSession());
 
+        const mcpError = (
+          reason: ProviderAdapter.ProviderAdapterMcpError["reason"],
+          details: { readonly serverName?: string; readonly cause?: unknown } = {},
+        ) =>
+          new ProviderAdapter.ProviderAdapterMcpError({
+            driver: CLAUDE_PROVIDER,
+            reason,
+            ...details,
+          });
+
+        // MCP servers run inside the CLI process, so only the thread's live
+        // query can answer. Opening one here would start Claude outside a turn.
+        const liveMcpControls = Effect.fnUntraced(function* (
+          providerThread: OrchestrationV2ProviderThread,
+        ) {
+          const existing = yield* Ref.get(queryContext);
+          if (
+            existing === null ||
+            existing.stopping ||
+            existing.nativeThreadId !== providerThread.nativeThreadRef?.nativeId
+          ) {
+            return yield* mcpError("session-not-running");
+          }
+          if (existing.query.mcp === undefined) {
+            return yield* mcpError("provider-failure", {
+              cause: "The Claude query does not expose MCP controls.",
+            });
+          }
+          return existing.query.mcp;
+        });
+
+        const listMcpServers = Effect.fn("ClaudeAdapterV2.listMcpServers")(
+          function* (listInput: { readonly providerThread: OrchestrationV2ProviderThread }) {
+            const controls = yield* liveMcpControls(listInput.providerThread);
+            return claudeMcpServers(yield* controls.status);
+          },
+          (effect) =>
+            effect.pipe(
+              Effect.mapError((cause) =>
+                isProviderAdapterMcpError(cause) ? cause : mcpError("provider-failure", { cause }),
+              ),
+            ),
+        );
+
+        const actOnMcpServer = Effect.fn("ClaudeAdapterV2.actOnMcpServer")(
+          function* (actInput: ProviderAdapter.ProviderAdapterV2McpActionInput) {
+            const controls = yield* liveMcpControls(actInput.providerThread);
+            const reported = (yield* controls.status).find(
+              (candidate) => candidate.name === actInput.serverName,
+            );
+            const server = reported === undefined ? undefined : claudeMcpServer(reported);
+            if (server === undefined) {
+              return yield* mcpError("server-not-found", { serverName: actInput.serverName });
+            }
+            // A pasted callback finishes a sign-in that `authenticate` started.
+            // Its status may already have moved on, and the CLI rejects a
+            // callback when no sign-in is pending.
+            const allowed =
+              actInput.action === "submit-oauth-callback"
+                ? !server.managed && server.status !== "disabled"
+                : server.actions.includes(actInput.action);
+            if (!allowed) {
+              return yield* mcpError("action-unavailable", { serverName: server.name });
+            }
+            let auth: ProviderMcpActionResult["auth"];
+            switch (actInput.action) {
+              case "reconnect":
+                yield* controls.reconnect(server.name);
+                break;
+              case "enable":
+              case "disable":
+                yield* controls.toggle(server.name, actInput.action === "enable");
+                break;
+              case "authenticate": {
+                const started = yield* controls.authenticate(server.name);
+                const url = started.authUrl?.trim();
+                if (url === undefined || url.length === 0) break;
+                if (!isOpenableClaudeMcpAuthUrl(url)) {
+                  return yield* mcpError("provider-failure", {
+                    serverName: server.name,
+                    cause: "Claude returned a sign-in URL that is not http(s).",
+                  });
+                }
+                auth = { url, acceptsCallback: started.callbackExpected };
+                break;
+              }
+              case "clear-auth":
+                yield* controls.clearAuth(server.name);
+                break;
+              case "submit-oauth-callback":
+                yield* controls.submitOAuthCallbackUrl(server.name, actInput.callbackUrl);
+                break;
+            }
+            const servers = claudeMcpServers(yield* controls.status);
+            return auth === undefined ? { servers } : { servers, auth };
+          },
+          (effect, actInput) =>
+            effect.pipe(
+              Effect.mapError((cause) =>
+                isProviderAdapterMcpError(cause)
+                  ? cause
+                  : mcpError("provider-failure", { serverName: actInput.serverName, cause }),
+              ),
+            ),
+        );
+
         const runtime: ProviderAdapter.ProviderAdapterV2SessionRuntime = {
           instanceId: adapterOptions.instanceId,
           driver: CLAUDE_PROVIDER,
@@ -7560,6 +7962,7 @@ export function makeClaudeAdapterV2(
             }),
           steerTurn,
           interruptTurn,
+          mcp: { list: listMcpServers, act: actOnMcpServer },
           respondToRuntimeRequest: Effect.fn("ClaudeAdapterV2.respondToRuntimeRequest")(
             function* (requestInput) {
               const pending = (yield* Ref.get(pendingRuntimeRequests)).get(

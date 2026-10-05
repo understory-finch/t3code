@@ -115,6 +115,7 @@ import * as Keybindings from "./keybindings.ts";
 import * as ExternalLauncher from "./process/externalLauncher.ts";
 import * as ThreadManagementService from "./orchestration-v2/ThreadManagementService.ts";
 import * as ProviderSessionManager from "./orchestration-v2/ProviderSessionManager.ts";
+import * as ProviderMcpService from "./orchestration-v2/ProviderMcpService.ts";
 import * as ThreadLaunchService from "./orchestration-v2/ThreadLaunchService.ts";
 import * as ThreadMessageIntake from "./orchestration-v2/ThreadMessageIntake.ts";
 import * as IdAllocator from "./orchestration-v2/IdAllocator.ts";
@@ -1199,6 +1200,7 @@ const makeWsRpcLayer = (
       const threadSearch = yield* ThreadSearch.ThreadSearch;
 
       const providerSessionsV2 = yield* ProviderSessionManager.ProviderSessionManagerV2;
+      const providerMcp = yield* ProviderMcpService.ProviderMcpService;
       const analytics = yield* AnalyticsService.AnalyticsService;
       // Client-origin attribution (#7774): every thread/turn the connecting
       // client starts is credited to its surface + app version. Best-effort:
@@ -2383,6 +2385,14 @@ const makeWsRpcLayer = (
             ),
             { "rpc.aggregate": "provider" },
           ),
+        [WS_METHODS.providerMcpList]: (input) =>
+          observeRpcEffect(WS_METHODS.providerMcpList, providerMcp.list(input), {
+            "rpc.aggregate": "provider",
+          }),
+        [WS_METHODS.providerMcpAction]: (input) =>
+          observeRpcEffect(WS_METHODS.providerMcpAction, providerMcp.act(input), {
+            "rpc.aggregate": "provider",
+          }),
         [WS_METHODS.serverUpdateProvider]: (input) =>
           observeRpcEffect(
             WS_METHODS.serverUpdateProvider,
