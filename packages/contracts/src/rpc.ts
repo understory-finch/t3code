@@ -144,6 +144,13 @@ import {
 } from "./provider.ts";
 import { ProviderInstanceId, ProviderInstanceMutation } from "./providerInstance.ts";
 import {
+  ProviderMcpActionInput,
+  ProviderMcpActionResult,
+  ProviderMcpError,
+  ProviderMcpListInput,
+  ProviderMcpListResult,
+} from "./providerMcp.ts";
+import {
   PullRequestActionInput,
   PullRequestActivity,
   PullRequestCommentInput,
@@ -364,6 +371,8 @@ export const WS_METHODS = {
 
   // Provider methods
   providerUploadFeedback: "provider.uploadFeedback",
+  providerMcpList: "provider.mcp.list",
+  providerMcpAction: "provider.mcp.action",
   providerAuthStart: "provider.auth.start",
   providerConsumeResetCredit: "provider.consumeResetCredit",
   providerAuthComplete: "provider.auth.complete",
@@ -1229,6 +1238,18 @@ const WsProviderUploadFeedbackRpc = Rpc.make(WS_METHODS.providerUploadFeedback, 
   error: Schema.Union([ProviderUploadFeedbackError, EnvironmentAuthorizationError]),
 });
 
+const WsProviderMcpListRpc = Rpc.make(WS_METHODS.providerMcpList, {
+  payload: ProviderMcpListInput,
+  success: ProviderMcpListResult,
+  error: Schema.Union([ProviderMcpError, EnvironmentAuthorizationError]),
+});
+
+const WsProviderMcpActionRpc = Rpc.make(WS_METHODS.providerMcpAction, {
+  payload: ProviderMcpActionInput,
+  success: ProviderMcpActionResult,
+  error: Schema.Union([ProviderMcpError, EnvironmentAuthorizationError]),
+});
+
 const WsSubscribeVcsStatusRpc = Rpc.make(WS_METHODS.subscribeVcsStatus, {
   payload: VcsStatusInput,
   success: VcsStatusStreamEvent,
@@ -1811,6 +1832,8 @@ export const WsRpcGroup = RpcGroup.make(
   WsAttachmentsCreateUploadUrlRpc,
   WsAttachmentsDeleteRpc,
   WsProviderUploadFeedbackRpc,
+  WsProviderMcpListRpc,
+  WsProviderMcpActionRpc,
   WsSubscribeVcsStatusRpc,
   WsSubscribeWorktreeSetupRpc,
   WsWorktreeSetupCancelRpc,
