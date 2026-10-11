@@ -14,7 +14,7 @@ import * as Layer from "effect/Layer";
 import * as Option from "effect/Option";
 
 import * as ProjectionStore from "./ProjectionStore.ts";
-import * as ProviderAdapter from "./ProviderAdapter.ts";
+import * as ProviderAdapter from "@t3tools/provider-core/server/ProviderAdapter";
 import * as ProviderSessionManager from "./ProviderSessionManager.ts";
 
 const ACTION_PHRASES: Record<ProviderMcpActionInput["action"], string> = {

@@ -14,7 +14,7 @@ import * as Option from "effect/Option";
 import * as Schema from "effect/Schema";
 
 import * as ProjectionStore from "./ProjectionStore.ts";
-import * as ProviderAdapter from "./ProviderAdapter.ts";
+import * as ProviderAdapter from "@t3tools/provider-core/server/ProviderAdapter";
 import * as ProviderMcpService from "./ProviderMcpService.ts";
 import * as ProviderSessionManager from "./ProviderSessionManager.ts";
 

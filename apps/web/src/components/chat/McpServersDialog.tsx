@@ -15,7 +15,7 @@ import {
   type ScopedThreadRef,
 } from "@t3tools/contracts";
 import * as Schema from "effect/Schema";
-import { Atom } from "effect/unstable/reactivity";
+import { Atom } from "effect/reactivity";
 import { ExternalLinkIcon, PlugIcon } from "lucide-react";
 import { useCallback, useEffect, useRef, useState } from "react";
 
